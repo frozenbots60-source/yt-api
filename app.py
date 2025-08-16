@@ -1,3 +1,4 @@
+# filename: app.py
 from flask import Flask, request, jsonify, send_file
 import yt_dlp
 import os
@@ -6,46 +7,113 @@ import requests
 import hashlib
 import glob
 import shutil
+import threading
+import json
+import logging
 
 app = Flask(__name__)
 
-# Base directory using /tmp (Render free plan uses ephemeral storage)
+# --- Configuration ---
 BASE_TEMP_DIR = "/tmp"
+os.makedirs(BASE_TEMP_DIR, exist_ok=True)
 
-# Directory for storing temporary download files (will be cleared after each request)
 TEMP_DOWNLOAD_DIR = os.path.join(BASE_TEMP_DIR, "download")
 os.makedirs(TEMP_DOWNLOAD_DIR, exist_ok=True)
 
-# Directory for storing cached audio files (persists until container restart)
 CACHE_DIR = os.path.join(BASE_TEMP_DIR, "cache")
 os.makedirs(CACHE_DIR, exist_ok=True)
 
-# Directory for storing cached video files separately
 CACHE_VIDEO_DIR = os.path.join(BASE_TEMP_DIR, "cache_video")
 os.makedirs(CACHE_VIDEO_DIR, exist_ok=True)
 
-# Maximum cache size in bytes (adjusted to 500MB for Render free plan)
 MAX_CACHE_SIZE = 500 * 1024 * 1024  # 500MB
 
-# Cookie file path: allow override via environment variable COOKIE_FILE_PATH
-# Ensure this is a valid cookies.txt in Netscape format (export from browser)
 COOKIE_FILE_PATH = os.getenv("COOKIE_FILE_PATH", "cookies.txt")
 if COOKIE_FILE_PATH:
-    # If relative path, make absolute under working dir or /tmp
     COOKIE_FILE_PATH = os.path.abspath(COOKIE_FILE_PATH)
-# Check existence now:
 if COOKIE_FILE_PATH and os.path.isfile(COOKIE_FILE_PATH):
     app.logger.info(f"Using cookie file at: {COOKIE_FILE_PATH}")
 else:
-    app.logger.warning(f"Cookie file not found or unreadable at: {COOKIE_FILE_PATH}. "
-                       "Continuing without cookies.")
-    COOKIE_FILE_PATH = None  # disable use if not valid
+    app.logger.warning(f"Cookie file not found or unreadable at: {COOKIE_FILE_PATH}. Continuing without cookies.")
+    COOKIE_FILE_PATH = None
 
-# External Search API URL (used for searching YouTube by title or resolving Spotify links).
+# External Search API (your existing service)
 SEARCH_API_URL = "https://odd-block-a945.tenopno.workers.dev/search"
 
+# --- API Keys (hard-coded for now) ---
+# Add or change keys here. For production, switch to env vars or a secrets manager.
+API_KEYS = {
+    "sa-9rfafuafuafu0auf": True,
+}
+
+
+# Bindings file (persists across requests until container restart)
+BINDINGS_FILE = os.path.join(BASE_TEMP_DIR, "api_bindings.json")
+_bindings_lock = threading.Lock()
+
+def _load_bindings():
+    with _bindings_lock:
+        if not os.path.isfile(BINDINGS_FILE):
+            return {}
+        try:
+            with open(BINDINGS_FILE, "r") as f:
+                return json.load(f)
+        except Exception as e:
+            app.logger.warning(f"Failed to load bindings file: {e}")
+            return {}
+
+def _save_bindings(bindings: dict):
+    with _bindings_lock:
+        try:
+            with open(BINDINGS_FILE, "w") as f:
+                json.dump(bindings, f)
+        except Exception as e:
+            app.logger.error(f"Failed to save bindings file: {e}")
+
+# --- Authorization helper ---
+def authorize_request():
+    """
+    Expects query params:
+      - apikey: the API key (hard-coded for now)
+      - token: the Telegram bot token (used for binding)
+    Behavior:
+      - If apikey unknown -> 401
+      - If token not yet bound -> bind token -> apikey (unless apikey already bound to another token)
+      - If token bound to different apikey -> 403
+      - If apikey already bound to different token -> 403
+    Returns: (None) if authorized, or (response, status_code) tuple to return immediately.
+    """
+    apikey = (request.args.get("apikey") or "").strip()
+    token = (request.args.get("token") or "").strip()
+
+    if not apikey or not token:
+        return jsonify({"error": "Both 'apikey' and 'token' query parameters are required"}), 401
+
+    if apikey not in API_KEYS:
+        return jsonify({"error": "Invalid API key"}), 401
+
+    bindings = _load_bindings()
+    token_bound_key = bindings.get(token)
+
+    # If apikey is already bound to a different token -> forbidden
+    for t, k in bindings.items():
+        if k == apikey and t != token:
+            return jsonify({"error": "API key already bound to another token"}), 403
+
+    if token_bound_key is None:
+        # First-time use for this token: bind it
+        bindings[token] = apikey
+        _save_bindings(bindings)
+        app.logger.info(f"Bound token (first use) to apikey: token=<redacted> apikey={apikey}")
+        # continue
+    elif token_bound_key != apikey:
+        return jsonify({"error": "Token already bound to a different API key"}), 403
+
+    # authorized
+    return None
+
+# --- Utility functions (unchanged except for logging) ---
 def get_cache_key(video_url: str) -> str:
-    """Generate a cache key from the video URL."""
     return hashlib.md5(video_url.encode('utf-8')).hexdigest()
 
 def get_directory_size(directory: str) -> int:
@@ -70,10 +138,6 @@ def check_cache_size_and_cleanup():
                     app.logger.warning(f"Error deleting cache file {file_path}: {e}")
 
 def resolve_spotify_link(url: str) -> str:
-    """
-    If the URL is a Spotify link, use the search API to find the corresponding YouTube link.
-    Otherwise, return the URL unchanged.
-    """
     if "spotify.com" in url:
         params = {"title": url}
         resp = requests.get(SEARCH_API_URL, params=params, timeout=15)
@@ -86,9 +150,6 @@ def resolve_spotify_link(url: str) -> str:
     return url
 
 def make_ydl_opts_audio(output_template: str):
-    """
-    Build yt-dlp options for audio-only download, including cookiefile if valid.
-    """
     ffmpeg_path = os.getenv("FFMPEG_PATH", "/usr/bin/ffmpeg")
     opts = {
         'format': 'worstaudio',
@@ -103,9 +164,6 @@ def make_ydl_opts_audio(output_template: str):
     return opts
 
 def make_ydl_opts_video(output_template: str):
-    """
-    Build yt-dlp options for video+audio download, <=240p video + worst audio.
-    """
     ffmpeg_path = os.getenv("FFMPEG_PATH", "/usr/bin/ffmpeg")
     opts = {
         'format': 'worstvideo[height<=240]+worstaudio',
@@ -134,10 +192,8 @@ def download_audio(video_url: str) -> str:
         try:
             info = ydl.extract_info(video_url, download=True)
             downloaded_file = ydl.prepare_filename(info)
-            # Determine extension
             ext = info.get("ext", os.path.splitext(downloaded_file)[1].lstrip(".")) or "m4a"
             cached_file_path = os.path.join(CACHE_DIR, f"{cache_key}.{ext}")
-            # Move to cache
             shutil.move(downloaded_file, cached_file_path)
             check_cache_size_and_cleanup()
             return cached_file_path
@@ -160,7 +216,6 @@ def download_video(video_url: str) -> str:
             info = ydl.extract_info(video_url, download=True)
             downloaded_file = ydl.prepare_filename(info)
             cached_file_path = os.path.join(CACHE_VIDEO_DIR, f"{cache_key}.mp4")
-            # Move/rename to ensure .mp4
             if os.path.abspath(downloaded_file) != os.path.abspath(cached_file_path):
                 shutil.move(downloaded_file, cached_file_path)
             check_cache_size_and_cleanup()
@@ -169,8 +224,15 @@ def download_video(video_url: str) -> str:
             app.logger.error(f"Error downloading video for {video_url}: {e}")
             raise Exception(f"Error downloading video: {e}")
 
+# --- Endpoints ---
+
 @app.route('/search', methods=['GET'])
 def search_video():
+    # require apikey + token
+    auth = authorize_request()
+    if auth:
+        return auth
+
     try:
         query = request.args.get('title')
         if not query:
@@ -193,6 +255,10 @@ def search_video():
 
 @app.route('/vdown', methods=['GET'])
 def download_video_endpoint():
+    auth = authorize_request()
+    if auth:
+        return auth
+
     try:
         video_url = request.args.get('url')
         video_title = request.args.get('title')
@@ -219,7 +285,6 @@ def download_video_endpoint():
         app.logger.error(f"Exception in /vdown: {e}")
         return jsonify({"error": str(e)}), 500
     finally:
-        # Clean up temporary download files only (not the caches)
         for file in os.listdir(TEMP_DOWNLOAD_DIR):
             file_path = os.path.join(TEMP_DOWNLOAD_DIR, file)
             try:
@@ -229,6 +294,10 @@ def download_video_endpoint():
 
 @app.route('/download', methods=['GET'])
 def download_audio_endpoint():
+    auth = authorize_request()
+    if auth:
+        return auth
+
     try:
         video_url = request.args.get('url')
         video_title = request.args.get('title')
@@ -265,22 +334,17 @@ def download_audio_endpoint():
 @app.route('/')
 def home():
     return """
-    <h1>🎶 YouTube Audio/Video Downloader API</h1>
-    <p>Use this API to search and download audio or video from YouTube.</p>
+    <h1>🎶 YouTube Audio/Video Downloader API (API key protected)</h1>
+    <p>Use this API to search and download audio or video from YouTube. All endpoints that perform searches/downloads require <code>apikey</code> and <code>token</code> query parameters.</p>
     <p><strong>Endpoints:</strong></p>
     <ul>
-        <li><strong>/search</strong>: Search for a video by title. Query parameter: <code>?title=</code></li>
-        <li><strong>/download</strong>: Download audio by URL or search by title. Query parameters: <code>?url=</code> or <code>?title=</code></li>
-        <li><strong>/vdown</strong>: Download video (≤240p + worst audio) by URL or search by title. Query parameters: <code>?url=</code> or <code>?title=</code></li>
+        <li><strong>/search</strong>: Search for a video by title. Query param: <code>?title=&apikey=&token=</code></li>
+        <li><strong>/download</strong>: Download audio by URL or search by title. Query params: <code>?url=</code> or <code>?title=</code> plus <code>&apikey=&token=</code></li>
+        <li><strong>/vdown</strong>: Download video (≤240p + worst audio) by URL or search by title. Query params: <code>?url=</code> or <code>?title=</code> plus <code>&apikey=&token=</code></li>
     </ul>
-    <p>Examples:</p>
-    <ul>
-        <li>Search: <code>/search?title=Your%20Favorite%20Song</code></li>
-        <li>Download by URL (audio): <code>/download?url=https://www.youtube.com/watch?v=dQw4w9WgXcQ</code></li>
-        <li>Download by Title (audio): <code>/download?title=Your%20Favorite%20Song</code></li>
-        <li>Download by URL (video): <code>/vdown?url=https://www.youtube.com/watch?v=dQw4w9WgXcQ</code></li>
-        <li>Download from Spotify: <code>/download?url=https://open.spotify.com/track/...</code></li>
-    </ul>
+    <p>Example:</p>
+    <pre>/download?url=https://www.youtube.com/watch?v=dQw4w9WgXcQ&amp;apikey=hardcoded-api-key-1&amp;token=123456:ABC-DEF</pre>
+    <p><em>Note:</em> Use standard URL query separators (&amp;). The API will bind the first token that uses an API key to that key. Subsequent requests with that token must use the same API key.</p>
     """
 
 if __name__ == '__main__':
