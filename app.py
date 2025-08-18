@@ -343,7 +343,7 @@ def home():
         <li><strong>/vdown</strong>: Download video (≤240p + worst audio) by URL or search by title. Query params: <code>?url=</code> or <code>?title=</code> plus <code>&apikey=&token=</code></li>
     </ul>
     <p>Example:</p>
-    <pre>/download?url=https://www.youtube.com/watch?v=dQw4w9WgXcQ&amp;apikey=hardcoded-api-key-1&amp;token=123456:ABC-DEF</pre>
+    <pre>/download?url=https://www.youtube.com/watch?v=dQw4w9WgXcQ&amp;apikey=yourapikey&amp;token=123456:ABC-DEF</pre>
     <p><em>Note:</em> Use standard URL query separators (&amp;). The API will bind the first token that uses an API key to that key. Subsequent requests with that token must use the same API key.</p>
     """
 
