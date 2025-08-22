@@ -41,9 +41,9 @@ else:
 SEARCH_API_URL = "https://odd-block-a945.tenopno.workers.dev/search"
 
 # --- API Keys (hard-coded for now) ---
-# Add or change keys here. For production, switch to env vars or a secrets manager.
 API_KEYS = {
     "hardcoded-api-key-1": True,
+    "hardcoded-api-key-2": True,  # new key added
     # "another-key": True
 }
 
