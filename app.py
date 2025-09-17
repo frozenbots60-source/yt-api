@@ -42,8 +42,8 @@ SEARCH_API_URL = "https://odd-block-a945.tenopno.workers.dev/search"
 
 # --- API Keys (hard-coded for now) ---
 API_KEYS = {
-    "hardcoded-api-key-1": True,
-    "hardcoded-api-key-2": True,  # new key added
+    "hardcoded-api-key-27": True,
+    "hardcoded-api-key-01": True,  # new key added
     # "another-key": True
 }
 
