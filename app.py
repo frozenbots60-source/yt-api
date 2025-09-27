@@ -164,15 +164,16 @@ def make_ydl_opts_audio(output_template: str):
     return opts
 
 def make_ydl_opts_video(output_template: str):
-    ffmpeg_path = os.getenv("FFMPEG_PATH", "/usr/bin/ffmpeg")
     opts = {
-        'format': 'worstvideo[height<=240]+worstaudio',
-        'merge_output_format': 'mp4',
+        # Pick the lowest quality progressive (video+audio in one file)
+        'format': 'worst[ext=mp4]/worst',  
         'outtmpl': output_template,
         'noplaylist': True,
         'quiet': True,
         'socket_timeout': 60,
-        'ffmpeg_location': ffmpeg_path,
+        # remove merge_output_format and ffmpeg_location
+        # 'merge_output_format': 'mp4',
+        # 'ffmpeg_location': ffmpeg_path,
     }
     if COOKIE_FILE_PATH:
         opts['cookiefile'] = COOKIE_FILE_PATH
