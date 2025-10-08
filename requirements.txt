@@ -1,6 +1,6 @@
-Flask==2.3.2
+Flask
 git+https://github.com/yt-dlp/yt-dlp.git
-gunicorn==21.2.0
+gunicorn
 flask[async]
 requests
 
