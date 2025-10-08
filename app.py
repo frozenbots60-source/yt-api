@@ -10,6 +10,7 @@ import shutil
 import threading
 import json
 import logging
+import time
 
 app = Flask(__name__)
 
@@ -40,79 +41,7 @@ else:
 # External Search API (your existing service)
 SEARCH_API_URL = "https://odd-block-a945.tenopno.workers.dev/search"
 
-# --- API Keys (hard-coded for now) ---
-API_KEYS = {
-    "hardcoded-api-key-27": True,
-    "hardcoded-api-key-01": True,  # new key added
-    # "another-key": True
-}
-
-# Bindings file (persists across requests until container restart)
-BINDINGS_FILE = os.path.join(BASE_TEMP_DIR, "api_bindings.json")
-_bindings_lock = threading.Lock()
-
-def _load_bindings():
-    with _bindings_lock:
-        if not os.path.isfile(BINDINGS_FILE):
-            return {}
-        try:
-            with open(BINDINGS_FILE, "r") as f:
-                return json.load(f)
-        except Exception as e:
-            app.logger.warning(f"Failed to load bindings file: {e}")
-            return {}
-
-def _save_bindings(bindings: dict):
-    with _bindings_lock:
-        try:
-            with open(BINDINGS_FILE, "w") as f:
-                json.dump(bindings, f)
-        except Exception as e:
-            app.logger.error(f"Failed to save bindings file: {e}")
-
-# --- Authorization helper ---
-def authorize_request():
-    """
-    Expects query params:
-      - apikey: the API key (hard-coded for now)
-      - token: the Telegram bot token (used for binding)
-    Behavior:
-      - If apikey unknown -> 401
-      - If token not yet bound -> bind token -> apikey (unless apikey already bound to another token)
-      - If token bound to different apikey -> 403
-      - If apikey already bound to different token -> 403
-    Returns: (None) if authorized, or (response, status_code) tuple to return immediately.
-    """
-    apikey = (request.args.get("apikey") or "").strip()
-    token = (request.args.get("token") or "").strip()
-
-    if not apikey or not token:
-        return jsonify({"error": "Both 'apikey' and 'token' query parameters are required"}), 401
-
-    if apikey not in API_KEYS:
-        return jsonify({"error": "Invalid API key"}), 401
-
-    bindings = _load_bindings()
-    token_bound_key = bindings.get(token)
-
-    # If apikey is already bound to a different token -> forbidden
-    for t, k in bindings.items():
-        if k == apikey and t != token:
-            return jsonify({"error": "API key already bound to another token"}), 403
-
-    if token_bound_key is None:
-        # First-time use for this token: bind it
-        bindings[token] = apikey
-        _save_bindings(bindings)
-        app.logger.info(f"Bound token (first use) to apikey: token=<redacted> apikey={apikey}")
-        # continue
-    elif token_bound_key != apikey:
-        return jsonify({"error": "Token already bound to a different API key"}), 403
-
-    # authorized
-    return None
-
-# --- Utility functions (unchanged except for logging) ---
+# --- Utility functions ---
 def get_cache_key(video_url: str) -> str:
     return hashlib.md5(video_url.encode('utf-8')).hexdigest()
 
@@ -137,6 +66,14 @@ def check_cache_size_and_cleanup():
                 except Exception as e:
                     app.logger.warning(f"Error deleting cache file {file_path}: {e}")
 
+# Background cache cleanup thread
+def periodic_cache_cleanup():
+    while True:
+        check_cache_size_and_cleanup()
+        time.sleep(60)  # every 60 seconds
+
+threading.Thread(target=periodic_cache_cleanup, daemon=True).start()
+
 def resolve_spotify_link(url: str) -> str:
     if "spotify.com" in url:
         params = {"title": url}
@@ -158,6 +95,8 @@ def make_ydl_opts_audio(output_template: str):
         'quiet': True,
         'socket_timeout': 60,
         'ffmpeg_location': ffmpeg_path,
+        'concurrent_fragment_downloads': 4,
+        'n_threads': 4,
     }
     if COOKIE_FILE_PATH:
         opts['cookiefile'] = COOKIE_FILE_PATH
@@ -165,15 +104,13 @@ def make_ydl_opts_audio(output_template: str):
 
 def make_ydl_opts_video(output_template: str):
     opts = {
-        # Pick the lowest quality progressive (video+audio in one file)
         'format': 'worst[ext=mp4]/worst',  
         'outtmpl': output_template,
         'noplaylist': True,
         'quiet': True,
         'socket_timeout': 60,
-        # remove merge_output_format and ffmpeg_location
-        # 'merge_output_format': 'mp4',
-        # 'ffmpeg_location': ffmpeg_path,
+        'concurrent_fragment_downloads': 4,
+        'n_threads': 4,
     }
     if COOKIE_FILE_PATH:
         opts['cookiefile'] = COOKIE_FILE_PATH
@@ -229,11 +166,6 @@ def download_video(video_url: str) -> str:
 
 @app.route('/search', methods=['GET'])
 def search_video():
-    # require apikey + token
-    auth = authorize_request()
-    if auth:
-        return auth
-
     try:
         query = request.args.get('title')
         if not query:
@@ -245,9 +177,15 @@ def search_video():
         search_result = resp.json()
         if not search_result or 'link' not in search_result:
             return jsonify({"error": "No videos found for the given query"}), 404
+        
+        # Pre-cache audio/video in background threads
+        video_url = search_result['link']
+        threading.Thread(target=download_audio, args=(video_url,), daemon=True).start()
+        threading.Thread(target=download_video, args=(video_url,), daemon=True).start()
+        
         return jsonify({
             "title": search_result.get("title"),
-            "url": search_result["link"],
+            "url": video_url,
             "duration": search_result.get("duration"),
         })
     except Exception as e:
@@ -256,10 +194,6 @@ def search_video():
 
 @app.route('/vdown', methods=['GET'])
 def download_video_endpoint():
-    auth = authorize_request()
-    if auth:
-        return auth
-
     try:
         video_url = request.args.get('url')
         video_title = request.args.get('title')
@@ -295,10 +229,6 @@ def download_video_endpoint():
 
 @app.route('/download', methods=['GET'])
 def download_audio_endpoint():
-    auth = authorize_request()
-    if auth:
-        return auth
-
     try:
         video_url = request.args.get('url')
         video_title = request.args.get('title')
@@ -335,28 +265,18 @@ def download_audio_endpoint():
 @app.route('/')
 def home():
     return """
-    <h1>🎶 YouTube Audio/Video Downloader API (API key protected)</h1>
-    <p>Use this API to search and download audio or video from YouTube. All endpoints that perform searches/downloads require <code>apikey</code> and <code>token</code> query parameters.</p>
+    <h1>🎶 YouTube Audio/Video Downloader API</h1>
+    <p>Use this API to search and download audio or video from YouTube.</p>
     <p><strong>Endpoints:</strong></p>
     <ul>
-        <li><strong>/search</strong>: Search for a video by title. Query param: <code>?title=&apikey=&token=</code></li>
-        <li><strong>/download</strong>: Download audio by URL or search by title. Query params: <code>?url=</code> or <code>?title=</code> plus <code>&apikey=&token=</code></li>
-        <li><strong>/vdown</strong>: Download video (≤240p + worst audio) by URL or search by title. Query params: <code>?url=</code> or <code>?title=</code> plus <code>&apikey=&token=</code></li>
+        <li><strong>/search</strong>: Search for a video by title. Query param: <code>?title=</code></li>
+        <li><strong>/download</strong>: Download audio by URL or search by title. Query params: <code>?url=</code> or <code>?title=</code></li>
+        <li><strong>/vdown</strong>: Download video (≤240p + worst audio) by URL or search by title. Query params: <code>?url=</code> or <code>?title=</code></li>
     </ul>
     <p>Example:</p>
-    <pre>/download?url=https://www.youtube.com/watch?v=dQw4w9WgXcQ&amp;apikey=yourapikey&amp;token=123456:ABC-DEF</pre>
-    <p><em>Note:</em> Use standard URL query separators (&amp;). The API will bind the first token that uses an API key to that key. Subsequent requests with that token must use the same API key.</p>
+    <pre>/download?url=https://www.youtube.com/watch?v=dQw4w9WgXcQ</pre>
     """
 
 if __name__ == '__main__':
     # For local testing
     app.run(host='0.0.0.0', port=int(os.environ.get("PORT", 5000)))
-
-
-
-
-
-
-
-
-
