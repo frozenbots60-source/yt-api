@@ -1,5 +1,5 @@
 Flask
-git+https://github.com/yt-dlp/yt-dlp.git
+yt-dlp
 gunicorn
 flask[async]
 requests
