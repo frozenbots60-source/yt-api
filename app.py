@@ -11,7 +11,6 @@ import threading
 import json
 import logging
 import time
-import subprocess
 
 app = Flask(__name__)
 
@@ -123,10 +122,6 @@ def download_audio(video_url: str) -> str:
     if cached_files:
         return cached_files[0]
 
-    # Check for HLS .m3u8 URL
-    if video_url.startswith("http") and video_url.endswith(".m3u8"):
-        return ffmpeg_hls_download(video_url)
-
     unique_id = str(uuid.uuid4())
     output_template = os.path.join(TEMP_DOWNLOAD_DIR, f"{unique_id}.%(ext)s")
     ydl_opts = make_ydl_opts_audio(output_template)
@@ -143,37 +138,6 @@ def download_audio(video_url: str) -> str:
         except Exception as e:
             app.logger.error(f"Error downloading audio for {video_url}: {e}")
             raise Exception(f"Error downloading audio: {e}")
-
-def ffmpeg_hls_download(m3u8_url: str) -> str:
-    """Downloads HLS audio and outputs a low-bitrate m4a file."""
-    cache_key = get_cache_key(m3u8_url)
-    cached_files = glob.glob(os.path.join(CACHE_DIR, f"{cache_key}.*"))
-    if cached_files:
-        return cached_files[0]
-
-    unique_id = str(uuid.uuid4())
-    output_path = os.path.join(TEMP_DOWNLOAD_DIR, f"{unique_id}.m4a")
-
-    # FFmpeg command for low-bitrate audio (48 kbps AAC)
-    ffmpeg_cmd = [
-        os.getenv("FFMPEG_PATH", "/usr/bin/ffmpeg"),
-        "-y",
-        "-i", m3u8_url,
-        "-c:a", "aac",
-        "-b:a", "48k",
-        "-vn",
-        output_path
-    ]
-
-    try:
-        subprocess.run(ffmpeg_cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        cached_file_path = os.path.join(CACHE_DIR, f"{cache_key}.m4a")
-        shutil.move(output_path, cached_file_path)
-        check_cache_size_and_cleanup()
-        return cached_file_path
-    except subprocess.CalledProcessError as e:
-        app.logger.error(f"FFmpeg HLS download failed for {m3u8_url}: {e.stderr.decode()}")
-        raise Exception("FFmpeg HLS download failed")
 
 def download_video(video_url: str) -> str:
     cache_key = hashlib.md5((video_url + "_video").encode('utf-8')).hexdigest()
@@ -281,13 +245,7 @@ def download_audio_endpoint():
             video_url = search_result['link']
         if video_url and "spotify.com" in video_url:
             video_url = resolve_spotify_link(video_url)
-
-        # Handle HLS .m3u8 links or regular YouTube URLs
-        if video_url.startswith("http") and video_url.endswith(".m3u8"):
-            cached_file_path = ffmpeg_hls_download(video_url)
-        else:
-            cached_file_path = download_audio(video_url)
-
+        cached_file_path = download_audio(video_url)
         return send_file(
             cached_file_path,
             as_attachment=True,
