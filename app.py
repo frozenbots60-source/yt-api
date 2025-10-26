@@ -1,8 +1,10 @@
-from flask import Flask, request, jsonify, Response
+from flask import Flask, request, jsonify, send_file
 import yt_dlp
 import os
+import uuid
 import requests
 import shutil
+import subprocess
 import logging
 
 app = Flask(__name__)
@@ -10,6 +12,9 @@ app = Flask(__name__)
 # --- Configuration ---
 BASE_TEMP_DIR = "/tmp"
 os.makedirs(BASE_TEMP_DIR, exist_ok=True)
+
+TEMP_DOWNLOAD_DIR = os.path.join(BASE_TEMP_DIR, "download")
+os.makedirs(TEMP_DOWNLOAD_DIR, exist_ok=True)
 
 COOKIE_FILE_PATH = os.getenv("COOKIE_FILE_PATH", "cookies.txt")
 if COOKIE_FILE_PATH:
@@ -35,50 +40,91 @@ def resolve_spotify_link(url: str) -> str:
         return search_result['link']
     return url
 
-def make_ydl_opts_audio():
+def make_ydl_opts_audio(output_template: str):
+    ffmpeg_path = shutil.which("ffmpeg")
     opts = {
         'format': 'bestaudio[ext=webm]/bestaudio/best',
+        'outtmpl': output_template,
         'noplaylist': True,
         'quiet': True,
         'socket_timeout': 60,
-        'n_threads': 8,
-        'concurrent_fragment_downloads': 8,
+        'n_threads': 12,
+        'concurrent_fragment_downloads': 12,
     }
     if COOKIE_FILE_PATH:
         opts['cookiefile'] = COOKIE_FILE_PATH
     return opts
 
-def make_ydl_opts_video():
+def make_ydl_opts_video(output_template: str):
     opts = {
         'format': 'worstvideo[ext=mp4]+worstaudio/best',
+        'outtmpl': output_template,
         'noplaylist': True,
         'quiet': True,
         'socket_timeout': 60,
-        'n_threads': 8,
-        'concurrent_fragment_downloads': 8,
+        'n_threads': 12,
+        'concurrent_fragment_downloads': 12,
     }
     if COOKIE_FILE_PATH:
         opts['cookiefile'] = COOKIE_FILE_PATH
     return opts
 
-def stream_yt(url, ydl_opts):
-    """
-    Generator to stream audio/video directly from yt-dlp
-    """
+def download_audio(video_url: str) -> str:
+    unique_id = str(uuid.uuid4())
+    output_template = os.path.join(TEMP_DOWNLOAD_DIR, f"{unique_id}.%(ext)s")
+    ydl_opts = make_ydl_opts_audio(output_template)
+
+    ffmpeg_path = shutil.which("ffmpeg")
+    if not ffmpeg_path:
+        raise Exception("ffmpeg not found in PATH — install ffmpeg or add it to PATH")
+
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(url, download=False)
-        formats = info.get('formats', [info])
-        for fmt in formats:
-            if fmt.get('url'):
-                stream_url = fmt['url']
-                break
-        else:
-            raise Exception("No downloadable format found")
-        # stream directly
-        resp = requests.get(stream_url, stream=True, timeout=60)
-        for chunk in resp.iter_content(chunk_size=8192):
-            if chunk:
-                yield chunk
+        info = ydl.extract_info(video_url, download=True)
+        downloaded_file = ydl.prepare_filename(info)
+
+        # Skip conversion if already opus/webm
+        if downloaded_file.endswith(".webm") or downloaded_file.endswith(".opus"):
+            return downloaded_file
+
+        temp_audio_path = os.path.join(TEMP_DOWNLOAD_DIR, f"{unique_id}.opus")
+        ffmpeg_cmd = [
+            ffmpeg_path,
+            "-y",
+            "-i", downloaded_file,
+            "-vn",
+            "-c:a", "libopus",
+            "-b:a", "48k",
+            "-vbr", "on",
+            "-application", "audio",
+            "-threads", "0",
+            temp_audio_path
+        ]
+        completed = subprocess.run(ffmpeg_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        if completed.returncode != 0:
+            raise Exception(f"ffmpeg failed: {completed.stderr.decode('utf-8', errors='ignore')}")
+
+        try:
+            os.remove(downloaded_file)
+        except Exception:
+            pass
+
+        return temp_audio_path
+
+def download_video(video_url: str) -> str:
+    unique_id = str(uuid.uuid4())
+    output_template = os.path.join(TEMP_DOWNLOAD_DIR, f"{unique_id}.%(ext)s")
+    ydl_opts = make_ydl_opts_video(output_template)
+
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        info = ydl.extract_info(video_url, download=True)
+        downloaded_file = ydl.prepare_filename(info)
+        if not os.path.isfile(downloaded_file):
+            matches = [f for f in os.listdir(TEMP_DOWNLOAD_DIR) if f.startswith(unique_id)]
+            if matches:
+                downloaded_file = os.path.join(TEMP_DOWNLOAD_DIR, matches[0])
+            else:
+                raise Exception("Downloaded video file not found")
+        return downloaded_file
 
 # --- Endpoints ---
 @app.route('/search', methods=['GET'])
@@ -104,6 +150,7 @@ def search_video():
 
 @app.route('/vdown', methods=['GET'])
 def download_video_endpoint():
+    temp_files = []
     try:
         video_url = request.args.get('url')
         video_title = request.args.get('title')
@@ -119,17 +166,23 @@ def download_video_endpoint():
             video_url = search_result['link']
         if video_url and "spotify.com" in video_url:
             video_url = resolve_spotify_link(video_url)
-        ydl_opts = make_ydl_opts_video()
-        return Response(
-            stream_yt(video_url, ydl_opts),
-            mimetype='video/mp4',
-            headers={"Content-Disposition": f"attachment; filename=video.mp4"}
+        temp_file = download_video(video_url)
+        temp_files.append(temp_file)
+        return send_file(
+            temp_file,
+            as_attachment=True,
+            download_name=os.path.basename(temp_file)
         )
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+    finally:
+        for f in temp_files:
+            try:
+                os.remove(f)
+            except Exception:
+                pass
 
 @app.route('/download', methods=['GET'])
 def download_audio_endpoint():
+    temp_files = []
     try:
         video_url = request.args.get('url')
         video_title = request.args.get('title')
@@ -145,14 +198,19 @@ def download_audio_endpoint():
             video_url = search_result['link']
         if video_url and "spotify.com" in video_url:
             video_url = resolve_spotify_link(video_url)
-        ydl_opts = make_ydl_opts_audio()
-        return Response(
-            stream_yt(video_url, ydl_opts),
-            mimetype='audio/ogg',
-            headers={"Content-Disposition": f"attachment; filename=audio.opus"}
+        temp_file = download_audio(video_url)
+        temp_files.append(temp_file)
+        return send_file(
+            temp_file,
+            as_attachment=True,
+            download_name=os.path.basename(temp_file)
         )
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+    finally:
+        for f in temp_files:
+            try:
+                os.remove(f)
+            except Exception:
+                pass
 
 @app.route('/')
 def home():
@@ -171,3 +229,4 @@ def home():
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=int(os.environ.get("PORT", 5000)))
+
