@@ -4,6 +4,7 @@ import os
 import uuid
 import requests
 import shutil
+import subprocess
 import logging
 
 app = Flask(__name__)
@@ -49,11 +50,6 @@ def make_ydl_opts_audio(output_template: str):
         'socket_timeout': 60,
         'n_threads': 4,
         'concurrent_fragment_downloads': 4,
-        'postprocessors': [{
-            'key': 'FFmpegExtractAudio',
-            'preferredcodec': 'opus',
-            'preferredquality': '48',  # 48 kbps
-        }],
     }
     if COOKIE_FILE_PATH:
         opts['cookiefile'] = COOKIE_FILE_PATH
@@ -78,20 +74,41 @@ def download_audio(video_url: str) -> str:
     output_template = os.path.join(TEMP_DOWNLOAD_DIR, f"{unique_id}.%(ext)s")
     ydl_opts = make_ydl_opts_audio(output_template)
 
+    ffmpeg_path = shutil.which("ffmpeg")
+    if not ffmpeg_path:
+        raise Exception("ffmpeg not found in PATH — install ffmpeg or add it to PATH")
+
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(video_url, download=True)
         downloaded_file = ydl.prepare_filename(info)
-        # yt-dlp replaces extension with postprocessor extension
-        if not os.path.isfile(downloaded_file.replace('.webm', '.opus')):
-            matches = [f for f in os.listdir(TEMP_DOWNLOAD_DIR) if f.startswith(unique_id)]
-            if matches:
-                downloaded_file = os.path.join(TEMP_DOWNLOAD_DIR, matches[0])
-            else:
-                raise Exception("Audio file not found after yt-dlp run")
-        else:
-            downloaded_file = downloaded_file.replace('.webm', '.opus')
 
-        return downloaded_file
+        # Skip conversion if already opus/webm
+        if downloaded_file.endswith(".webm") or downloaded_file.endswith(".opus"):
+            return downloaded_file
+
+        temp_audio_path = os.path.join(TEMP_DOWNLOAD_DIR, f"{unique_id}.opus")
+        ffmpeg_cmd = [
+            ffmpeg_path,
+            "-y",
+            "-i", downloaded_file,
+            "-vn",
+            "-c:a", "libopus",
+            "-b:a", "48k",
+            "-vbr", "on",
+            "-application", "audio",
+            "-threads", "0",
+            temp_audio_path
+        ]
+        completed = subprocess.run(ffmpeg_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        if completed.returncode != 0:
+            raise Exception(f"ffmpeg failed: {completed.stderr.decode('utf-8', errors='ignore')}")
+
+        try:
+            os.remove(downloaded_file)
+        except Exception:
+            pass
+
+        return temp_audio_path
 
 def download_video(video_url: str) -> str:
     unique_id = str(uuid.uuid4())
@@ -212,3 +229,4 @@ def home():
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=int(os.environ.get("PORT", 5000)))
+
