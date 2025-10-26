@@ -1,12 +1,11 @@
-# filename: app.py
 from flask import Flask, request, jsonify, send_file
 import yt_dlp
 import os
 import uuid
 import requests
 import shutil
-import threading
 import subprocess
+import glob
 import logging
 
 app = Flask(__name__)
@@ -52,9 +51,11 @@ def make_ydl_opts_combined(output_template: str):
         'noplaylist': True,
         'quiet': True,
         'socket_timeout': 60,
-        'concurrent_fragment_downloads': 4,
+        'concurrent_fragment_downloads': 1,  # reduce concurrency for stability
         'n_threads': 4,
         'ffmpeg_location': ffmpeg_path,
+        'hls_prefer_native': False,  # force ffmpeg for HLS
+        'ignoreerrors': True,
     }
     if COOKIE_FILE_PATH:
         opts['cookiefile'] = COOKIE_FILE_PATH
@@ -67,17 +68,15 @@ def make_ydl_opts_video(output_template: str):
         'noplaylist': True,
         'quiet': True,
         'socket_timeout': 60,
-        'concurrent_fragment_downloads': 4,
+        'concurrent_fragment_downloads': 1,
         'n_threads': 4,
+        'ignoreerrors': True,
     }
     if COOKIE_FILE_PATH:
         opts['cookiefile'] = COOKIE_FILE_PATH
     return opts
 
 def download_audio(video_url: str) -> str:
-    """
-    Downloads video+audio, extracts Opus 48kbps, returns path to temp file.
-    """
     unique_id = str(uuid.uuid4())
     output_template = os.path.join(TEMP_DOWNLOAD_DIR, f"{unique_id}.%(ext)s")
     ydl_opts = make_ydl_opts_combined(output_template)
@@ -96,7 +95,6 @@ def download_audio(video_url: str) -> str:
             else:
                 raise Exception("Downloaded file not found after yt-dlp run")
 
-        # Temp output audio path
         temp_audio_path = os.path.join(TEMP_DOWNLOAD_DIR, f"{unique_id}.webm")
         ffmpeg_cmd = [
             ffmpeg_path,
@@ -137,7 +135,6 @@ def download_video(video_url: str) -> str:
         return downloaded_file
 
 # --- Endpoints ---
-
 @app.route('/search', methods=['GET'])
 def search_video():
     try:
@@ -186,7 +183,6 @@ def download_video_endpoint():
             download_name=os.path.basename(temp_file)
         )
     finally:
-        # Remove temp files after sending
         for f in temp_files:
             try:
                 os.remove(f)
@@ -219,7 +215,6 @@ def download_audio_endpoint():
             download_name=os.path.basename(temp_file)
         )
     finally:
-        # Remove temp files after sending
         for f in temp_files:
             try:
                 os.remove(f)
