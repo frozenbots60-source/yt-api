@@ -4,8 +4,6 @@ import os
 import uuid
 import requests
 import shutil
-import subprocess
-import glob
 import logging
 
 app = Flask(__name__)
@@ -26,7 +24,6 @@ else:
     app.logger.warning(f"Cookie file not found or unreadable at: {COOKIE_FILE_PATH}. Continuing without cookies.")
     COOKIE_FILE_PATH = None
 
-# External Search API
 SEARCH_API_URL = "https://odd-block-a945.tenopno.workers.dev/search"
 
 # --- Utility functions ---
@@ -42,20 +39,21 @@ def resolve_spotify_link(url: str) -> str:
         return search_result['link']
     return url
 
-def make_ydl_opts_combined(output_template: str):
+def make_ydl_opts_audio(output_template: str):
     ffmpeg_path = shutil.which("ffmpeg")
     opts = {
-        'format': 'worstvideo+worstaudio/worst',
-        'merge_output_format': 'mp4',
+        'format': 'bestaudio[ext=webm]/bestaudio/best',
         'outtmpl': output_template,
         'noplaylist': True,
         'quiet': True,
         'socket_timeout': 60,
-        'concurrent_fragment_downloads': 1,  # reduce concurrency for stability
         'n_threads': 4,
-        'ffmpeg_location': ffmpeg_path,
-        'hls_prefer_native': False,  # force ffmpeg for HLS
-        'ignoreerrors': True,
+        'concurrent_fragment_downloads': 4,
+        'postprocessors': [{
+            'key': 'FFmpegExtractAudio',
+            'preferredcodec': 'opus',
+            'preferredquality': '48',  # 48 kbps
+        }],
     }
     if COOKIE_FILE_PATH:
         opts['cookiefile'] = COOKIE_FILE_PATH
@@ -63,14 +61,13 @@ def make_ydl_opts_combined(output_template: str):
 
 def make_ydl_opts_video(output_template: str):
     opts = {
-        'format': 'worst[ext=mp4]/worst',
+        'format': 'worstvideo[ext=mp4]+worstaudio/best',
         'outtmpl': output_template,
         'noplaylist': True,
         'quiet': True,
         'socket_timeout': 60,
-        'concurrent_fragment_downloads': 1,
         'n_threads': 4,
-        'ignoreerrors': True,
+        'concurrent_fragment_downloads': 4,
     }
     if COOKIE_FILE_PATH:
         opts['cookiefile'] = COOKIE_FILE_PATH
@@ -79,43 +76,22 @@ def make_ydl_opts_video(output_template: str):
 def download_audio(video_url: str) -> str:
     unique_id = str(uuid.uuid4())
     output_template = os.path.join(TEMP_DOWNLOAD_DIR, f"{unique_id}.%(ext)s")
-    ydl_opts = make_ydl_opts_combined(output_template)
-
-    ffmpeg_path = shutil.which("ffmpeg")
-    if not ffmpeg_path:
-        raise Exception("ffmpeg not found in PATH — install ffmpeg or add it to PATH")
+    ydl_opts = make_ydl_opts_audio(output_template)
 
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(video_url, download=True)
         downloaded_file = ydl.prepare_filename(info)
-        if not os.path.isfile(downloaded_file):
-            matches = glob.glob(os.path.join(TEMP_DOWNLOAD_DIR, f"{unique_id}.*"))
+        # yt-dlp replaces extension with postprocessor extension
+        if not os.path.isfile(downloaded_file.replace('.webm', '.opus')):
+            matches = [f for f in os.listdir(TEMP_DOWNLOAD_DIR) if f.startswith(unique_id)]
             if matches:
-                downloaded_file = matches[0]
+                downloaded_file = os.path.join(TEMP_DOWNLOAD_DIR, matches[0])
             else:
-                raise Exception("Downloaded file not found after yt-dlp run")
+                raise Exception("Audio file not found after yt-dlp run")
+        else:
+            downloaded_file = downloaded_file.replace('.webm', '.opus')
 
-        temp_audio_path = os.path.join(TEMP_DOWNLOAD_DIR, f"{unique_id}.webm")
-        ffmpeg_cmd = [
-            ffmpeg_path,
-            "-y",
-            "-i", downloaded_file,
-            "-vn",
-            "-c:a", "libopus",
-            "-b:a", "48k",
-            "-vbr", "on",
-            temp_audio_path
-        ]
-        completed = subprocess.run(ffmpeg_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        if completed.returncode != 0:
-            raise Exception(f"ffmpeg failed: {completed.stderr.decode('utf-8', errors='ignore')}")
-
-        try:
-            os.remove(downloaded_file)
-        except Exception:
-            pass
-
-        return temp_audio_path
+        return downloaded_file
 
 def download_video(video_url: str) -> str:
     unique_id = str(uuid.uuid4())
@@ -126,12 +102,11 @@ def download_video(video_url: str) -> str:
         info = ydl.extract_info(video_url, download=True)
         downloaded_file = ydl.prepare_filename(info)
         if not os.path.isfile(downloaded_file):
-            matches = glob.glob(os.path.join(TEMP_DOWNLOAD_DIR, f"{unique_id}.*"))
+            matches = [f for f in os.listdir(TEMP_DOWNLOAD_DIR) if f.startswith(unique_id)]
             if matches:
-                downloaded_file = matches[0]
+                downloaded_file = os.path.join(TEMP_DOWNLOAD_DIR, matches[0])
             else:
                 raise Exception("Downloaded video file not found")
-
         return downloaded_file
 
 # --- Endpoints ---
@@ -148,7 +123,6 @@ def search_video():
         if not search_result or 'link' not in search_result:
             return jsonify({"error": "No videos found for the given query"}), 404
         video_url = search_result['link']
-
         return jsonify({
             "title": search_result.get("title"),
             "url": video_url,
