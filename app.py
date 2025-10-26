@@ -11,6 +11,7 @@ import threading
 import json
 import logging
 import time
+import subprocess
 
 app = Flask(__name__)
 
@@ -86,25 +87,28 @@ def resolve_spotify_link(url: str) -> str:
         return search_result['link']
     return url
 
-def make_ydl_opts_audio(output_template: str):
-    ffmpeg_path = os.getenv("FFMPEG_PATH", "/usr/bin/ffmpeg")
+def make_ydl_opts_combined(output_template: str):
+    ffmpeg_path = shutil.which("ffmpeg")  # auto-detect from PATH
     opts = {
-        'format': 'worstaudio',
+        'format': 'worstvideo+worstaudio/worst',
+        'merge_output_format': 'mp4',
         'outtmpl': output_template,
         'noplaylist': True,
         'quiet': True,
         'socket_timeout': 60,
-        'ffmpeg_location': ffmpeg_path,
         'concurrent_fragment_downloads': 4,
         'n_threads': 4,
+        'ffmpeg_location': ffmpeg_path,
     }
     if COOKIE_FILE_PATH:
         opts['cookiefile'] = COOKIE_FILE_PATH
     return opts
 
+
+
 def make_ydl_opts_video(output_template: str):
     opts = {
-        'format': 'worst[ext=mp4]/worst',  
+        'format': 'worst[ext=mp4]/worst',
         'outtmpl': output_template,
         'noplaylist': True,
         'quiet': True,
@@ -117,27 +121,85 @@ def make_ydl_opts_video(output_template: str):
     return opts
 
 def download_audio(video_url: str) -> str:
-    cache_key = get_cache_key(video_url)
+    """
+    Downloads video+audio (no forced single-stream), then extracts audio as
+    Opus-in-webm @ 48kbps and returns the cached webm path.
+    """
+    cache_key = get_cache_key(video_url + "_opus48")
+    # If webm cached, return immediately
     cached_files = glob.glob(os.path.join(CACHE_DIR, f"{cache_key}.*"))
+    # prefer .webm
+    for cf in cached_files:
+        if cf.endswith(".webm"):
+            return cf
     if cached_files:
         return cached_files[0]
 
     unique_id = str(uuid.uuid4())
     output_template = os.path.join(TEMP_DOWNLOAD_DIR, f"{unique_id}.%(ext)s")
-    ydl_opts = make_ydl_opts_audio(output_template)
+    ydl_opts = make_ydl_opts_combined(output_template)
+
+    import shutil
+    ffmpeg_path = shutil.which("ffmpeg")
+    if not ffmpeg_path:
+        # ffmpeg must exist for merging/transcoding; raise helpful error
+        app.logger.error("ffmpeg not found in PATH")
+        raise Exception("ffmpeg not found in PATH — install ffmpeg or add it to PATH")
 
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         try:
             info = ydl.extract_info(video_url, download=True)
             downloaded_file = ydl.prepare_filename(info)
-            ext = info.get("ext", os.path.splitext(downloaded_file)[1].lstrip(".")) or "m4a"
-            cached_file_path = os.path.join(CACHE_DIR, f"{cache_key}.{ext}")
-            shutil.move(downloaded_file, cached_file_path)
+            # If yt-dlp produced extra extension due to merge_output_format,
+            # ensure we have absolute path to the downloaded merged file.
+            if not os.path.isfile(downloaded_file):
+                # try to locate the file in temp dir matching unique_id.*
+                matches = glob.glob(os.path.join(TEMP_DOWNLOAD_DIR, f"{unique_id}.*"))
+                if matches:
+                    downloaded_file = matches[0]
+                else:
+                    raise Exception("Downloaded file not found after yt-dlp run")
+
+            # prepare final cached webm path
+            cached_file_path = os.path.join(CACHE_DIR, f"{cache_key}.webm")
+
+            # ffmpeg command: extract audio, encode to libopus @ 48k, webm container
+            ffmpeg_cmd = [
+                ffmpeg_path,
+                "-y",
+                "-i", downloaded_file,
+                "-vn",                       # no video
+                "-c:a", "libopus",           # encode Opus
+                "-b:a", "48k",               # bitrate 48kbps
+                "-vbr", "on",                # enable vbr for better quality (optional)
+                cached_file_path
+            ]
+
+            app.logger.info(f"Running ffmpeg to extract audio: {' '.join(ffmpeg_cmd)}")
+            completed = subprocess.run(ffmpeg_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            if completed.returncode != 0:
+                app.logger.error(f"ffmpeg failed: {completed.stderr.decode('utf-8', errors='ignore')}")
+                raise Exception("ffmpeg failed to extract audio")
+
+            # remove original merged download to save space
+            try:
+                os.remove(downloaded_file)
+            except Exception:
+                pass
+
+            # ensure cache size and cleanup if needed
             check_cache_size_and_cleanup()
             return cached_file_path
         except Exception as e:
-            app.logger.error(f"Error downloading audio for {video_url}: {e}")
+            app.logger.error(f"Error downloading/transcoding audio for {video_url}: {e}")
+            # Cleanup any partial files for this run
+            for f in glob.glob(os.path.join(TEMP_DOWNLOAD_DIR, f"{unique_id}.*")):
+                try:
+                    os.remove(f)
+                except Exception:
+                    pass
             raise Exception(f"Error downloading audio: {e}")
+
 
 def download_video(video_url: str) -> str:
     cache_key = hashlib.md5((video_url + "_video").encode('utf-8')).hexdigest()
@@ -153,6 +215,13 @@ def download_video(video_url: str) -> str:
         try:
             info = ydl.extract_info(video_url, download=True)
             downloaded_file = ydl.prepare_filename(info)
+            # fallback if filename not exactly as prepare_filename
+            if not os.path.isfile(downloaded_file):
+                matches = glob.glob(os.path.join(TEMP_DOWNLOAD_DIR, f"{unique_id}.*"))
+                if matches:
+                    downloaded_file = matches[0]
+                else:
+                    raise Exception("Downloaded video file not found")
             cached_file_path = os.path.join(CACHE_VIDEO_DIR, f"{cache_key}.mp4")
             if os.path.abspath(downloaded_file) != os.path.abspath(cached_file_path):
                 shutil.move(downloaded_file, cached_file_path)
