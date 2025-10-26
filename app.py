@@ -4,14 +4,10 @@ import yt_dlp
 import os
 import uuid
 import requests
-import hashlib
-import glob
 import shutil
 import threading
-import json
-import logging
-import time
 import subprocess
+import logging
 
 app = Flask(__name__)
 
@@ -22,14 +18,6 @@ os.makedirs(BASE_TEMP_DIR, exist_ok=True)
 TEMP_DOWNLOAD_DIR = os.path.join(BASE_TEMP_DIR, "download")
 os.makedirs(TEMP_DOWNLOAD_DIR, exist_ok=True)
 
-CACHE_DIR = os.path.join(BASE_TEMP_DIR, "cache")
-os.makedirs(CACHE_DIR, exist_ok=True)
-
-CACHE_VIDEO_DIR = os.path.join(BASE_TEMP_DIR, "cache_video")
-os.makedirs(CACHE_VIDEO_DIR, exist_ok=True)
-
-MAX_CACHE_SIZE = 500 * 1024 * 1024  # 500MB
-
 COOKIE_FILE_PATH = os.getenv("COOKIE_FILE_PATH", "cookies.txt")
 if COOKIE_FILE_PATH:
     COOKIE_FILE_PATH = os.path.abspath(COOKIE_FILE_PATH)
@@ -39,42 +27,10 @@ else:
     app.logger.warning(f"Cookie file not found or unreadable at: {COOKIE_FILE_PATH}. Continuing without cookies.")
     COOKIE_FILE_PATH = None
 
-# External Search API (your existing service)
+# External Search API
 SEARCH_API_URL = "https://odd-block-a945.tenopno.workers.dev/search"
 
 # --- Utility functions ---
-def get_cache_key(video_url: str) -> str:
-    return hashlib.md5(video_url.encode('utf-8')).hexdigest()
-
-def get_directory_size(directory: str) -> int:
-    total_size = 0
-    for dirpath, dirnames, filenames in os.walk(directory):
-        for f in filenames:
-            fp = os.path.join(dirpath, f)
-            if os.path.isfile(fp):
-                total_size += os.path.getsize(fp)
-    return total_size
-
-def check_cache_size_and_cleanup():
-    total_size = get_directory_size(CACHE_DIR) + get_directory_size(CACHE_VIDEO_DIR)
-    if total_size > MAX_CACHE_SIZE:
-        app.logger.info(f"Cache size {total_size} exceeds {MAX_CACHE_SIZE}, clearing caches.")
-        for cache_dir in [CACHE_DIR, CACHE_VIDEO_DIR]:
-            for file in os.listdir(cache_dir):
-                file_path = os.path.join(cache_dir, file)
-                try:
-                    os.remove(file_path)
-                except Exception as e:
-                    app.logger.warning(f"Error deleting cache file {file_path}: {e}")
-
-# Background cache cleanup thread
-def periodic_cache_cleanup():
-    while True:
-        check_cache_size_and_cleanup()
-        time.sleep(60)  # every 60 seconds
-
-threading.Thread(target=periodic_cache_cleanup, daemon=True).start()
-
 def resolve_spotify_link(url: str) -> str:
     if "spotify.com" in url:
         params = {"title": url}
@@ -88,7 +44,7 @@ def resolve_spotify_link(url: str) -> str:
     return url
 
 def make_ydl_opts_combined(output_template: str):
-    ffmpeg_path = shutil.which("ffmpeg")  # auto-detect from PATH
+    ffmpeg_path = shutil.which("ffmpeg")
     opts = {
         'format': 'worstvideo+worstaudio/worst',
         'merge_output_format': 'mp4',
@@ -103,8 +59,6 @@ def make_ydl_opts_combined(output_template: str):
     if COOKIE_FILE_PATH:
         opts['cookiefile'] = COOKIE_FILE_PATH
     return opts
-
-
 
 def make_ydl_opts_video(output_template: str):
     opts = {
@@ -122,114 +76,65 @@ def make_ydl_opts_video(output_template: str):
 
 def download_audio(video_url: str) -> str:
     """
-    Downloads video+audio (no forced single-stream), then extracts audio as
-    Opus-in-webm @ 48kbps and returns the cached webm path.
+    Downloads video+audio, extracts Opus 48kbps, returns path to temp file.
     """
-    cache_key = get_cache_key(video_url + "_opus48")
-    # If webm cached, return immediately
-    cached_files = glob.glob(os.path.join(CACHE_DIR, f"{cache_key}.*"))
-    # prefer .webm
-    for cf in cached_files:
-        if cf.endswith(".webm"):
-            return cf
-    if cached_files:
-        return cached_files[0]
-
     unique_id = str(uuid.uuid4())
     output_template = os.path.join(TEMP_DOWNLOAD_DIR, f"{unique_id}.%(ext)s")
     ydl_opts = make_ydl_opts_combined(output_template)
 
-    import shutil
     ffmpeg_path = shutil.which("ffmpeg")
     if not ffmpeg_path:
-        # ffmpeg must exist for merging/transcoding; raise helpful error
-        app.logger.error("ffmpeg not found in PATH")
         raise Exception("ffmpeg not found in PATH — install ffmpeg or add it to PATH")
 
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        info = ydl.extract_info(video_url, download=True)
+        downloaded_file = ydl.prepare_filename(info)
+        if not os.path.isfile(downloaded_file):
+            matches = glob.glob(os.path.join(TEMP_DOWNLOAD_DIR, f"{unique_id}.*"))
+            if matches:
+                downloaded_file = matches[0]
+            else:
+                raise Exception("Downloaded file not found after yt-dlp run")
+
+        # Temp output audio path
+        temp_audio_path = os.path.join(TEMP_DOWNLOAD_DIR, f"{unique_id}.webm")
+        ffmpeg_cmd = [
+            ffmpeg_path,
+            "-y",
+            "-i", downloaded_file,
+            "-vn",
+            "-c:a", "libopus",
+            "-b:a", "48k",
+            "-vbr", "on",
+            temp_audio_path
+        ]
+        completed = subprocess.run(ffmpeg_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        if completed.returncode != 0:
+            raise Exception(f"ffmpeg failed: {completed.stderr.decode('utf-8', errors='ignore')}")
+
         try:
-            info = ydl.extract_info(video_url, download=True)
-            downloaded_file = ydl.prepare_filename(info)
-            # If yt-dlp produced extra extension due to merge_output_format,
-            # ensure we have absolute path to the downloaded merged file.
-            if not os.path.isfile(downloaded_file):
-                # try to locate the file in temp dir matching unique_id.*
-                matches = glob.glob(os.path.join(TEMP_DOWNLOAD_DIR, f"{unique_id}.*"))
-                if matches:
-                    downloaded_file = matches[0]
-                else:
-                    raise Exception("Downloaded file not found after yt-dlp run")
+            os.remove(downloaded_file)
+        except Exception:
+            pass
 
-            # prepare final cached webm path
-            cached_file_path = os.path.join(CACHE_DIR, f"{cache_key}.webm")
-
-            # ffmpeg command: extract audio, encode to libopus @ 48k, webm container
-            ffmpeg_cmd = [
-                ffmpeg_path,
-                "-y",
-                "-i", downloaded_file,
-                "-vn",                       # no video
-                "-c:a", "libopus",           # encode Opus
-                "-b:a", "48k",               # bitrate 48kbps
-                "-vbr", "on",                # enable vbr for better quality (optional)
-                cached_file_path
-            ]
-
-            app.logger.info(f"Running ffmpeg to extract audio: {' '.join(ffmpeg_cmd)}")
-            completed = subprocess.run(ffmpeg_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-            if completed.returncode != 0:
-                app.logger.error(f"ffmpeg failed: {completed.stderr.decode('utf-8', errors='ignore')}")
-                raise Exception("ffmpeg failed to extract audio")
-
-            # remove original merged download to save space
-            try:
-                os.remove(downloaded_file)
-            except Exception:
-                pass
-
-            # ensure cache size and cleanup if needed
-            check_cache_size_and_cleanup()
-            return cached_file_path
-        except Exception as e:
-            app.logger.error(f"Error downloading/transcoding audio for {video_url}: {e}")
-            # Cleanup any partial files for this run
-            for f in glob.glob(os.path.join(TEMP_DOWNLOAD_DIR, f"{unique_id}.*")):
-                try:
-                    os.remove(f)
-                except Exception:
-                    pass
-            raise Exception(f"Error downloading audio: {e}")
-
+        return temp_audio_path
 
 def download_video(video_url: str) -> str:
-    cache_key = hashlib.md5((video_url + "_video").encode('utf-8')).hexdigest()
-    cached_files = glob.glob(os.path.join(CACHE_VIDEO_DIR, f"{cache_key}.*"))
-    if cached_files:
-        return cached_files[0]
-
     unique_id = str(uuid.uuid4())
     output_template = os.path.join(TEMP_DOWNLOAD_DIR, f"{unique_id}.%(ext)s")
     ydl_opts = make_ydl_opts_video(output_template)
 
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        try:
-            info = ydl.extract_info(video_url, download=True)
-            downloaded_file = ydl.prepare_filename(info)
-            # fallback if filename not exactly as prepare_filename
-            if not os.path.isfile(downloaded_file):
-                matches = glob.glob(os.path.join(TEMP_DOWNLOAD_DIR, f"{unique_id}.*"))
-                if matches:
-                    downloaded_file = matches[0]
-                else:
-                    raise Exception("Downloaded video file not found")
-            cached_file_path = os.path.join(CACHE_VIDEO_DIR, f"{cache_key}.mp4")
-            if os.path.abspath(downloaded_file) != os.path.abspath(cached_file_path):
-                shutil.move(downloaded_file, cached_file_path)
-            check_cache_size_and_cleanup()
-            return cached_file_path
-        except Exception as e:
-            app.logger.error(f"Error downloading video for {video_url}: {e}")
-            raise Exception(f"Error downloading video: {e}")
+        info = ydl.extract_info(video_url, download=True)
+        downloaded_file = ydl.prepare_filename(info)
+        if not os.path.isfile(downloaded_file):
+            matches = glob.glob(os.path.join(TEMP_DOWNLOAD_DIR, f"{unique_id}.*"))
+            if matches:
+                downloaded_file = matches[0]
+            else:
+                raise Exception("Downloaded video file not found")
+
+        return downloaded_file
 
 # --- Endpoints ---
 
@@ -241,28 +146,23 @@ def search_video():
             return jsonify({"error": "The 'title' parameter is required"}), 400
         resp = requests.get(SEARCH_API_URL, params={"title": query}, timeout=15)
         if resp.status_code != 200:
-            app.logger.error(f"Search API returned {resp.status_code} for query {query}")
             return jsonify({"error": "Failed to fetch search results"}), 500
         search_result = resp.json()
         if not search_result or 'link' not in search_result:
             return jsonify({"error": "No videos found for the given query"}), 404
-        
-        # Pre-cache audio/video in background threads
         video_url = search_result['link']
-        threading.Thread(target=download_audio, args=(video_url,), daemon=True).start()
-        threading.Thread(target=download_video, args=(video_url,), daemon=True).start()
-        
+
         return jsonify({
             "title": search_result.get("title"),
             "url": video_url,
             "duration": search_result.get("duration"),
         })
     except Exception as e:
-        app.logger.error(f"Exception in /search: {e}")
         return jsonify({"error": str(e)}), 500
 
 @app.route('/vdown', methods=['GET'])
 def download_video_endpoint():
+    temp_files = []
     try:
         video_url = request.args.get('url')
         video_title = request.args.get('title')
@@ -271,7 +171,6 @@ def download_video_endpoint():
         if video_title and not video_url:
             resp = requests.get(SEARCH_API_URL, params={"title": video_title}, timeout=15)
             if resp.status_code != 200:
-                app.logger.error(f"Search API error for title {video_title}: {resp.status_code}")
                 return jsonify({"error": "Failed to fetch search results"}), 500
             search_result = resp.json()
             if not search_result or 'link' not in search_result:
@@ -279,25 +178,24 @@ def download_video_endpoint():
             video_url = search_result['link']
         if video_url and "spotify.com" in video_url:
             video_url = resolve_spotify_link(video_url)
-        cached_file_path = download_video(video_url)
+        temp_file = download_video(video_url)
+        temp_files.append(temp_file)
         return send_file(
-            cached_file_path,
+            temp_file,
             as_attachment=True,
-            download_name=os.path.basename(cached_file_path)
+            download_name=os.path.basename(temp_file)
         )
-    except Exception as e:
-        app.logger.error(f"Exception in /vdown: {e}")
-        return jsonify({"error": str(e)}), 500
     finally:
-        for file in os.listdir(TEMP_DOWNLOAD_DIR):
-            file_path = os.path.join(TEMP_DOWNLOAD_DIR, file)
+        # Remove temp files after sending
+        for f in temp_files:
             try:
-                os.remove(file_path)
-            except Exception as cleanup_error:
-                app.logger.warning(f"Error deleting temp file {file_path}: {cleanup_error}")
+                os.remove(f)
+            except Exception:
+                pass
 
 @app.route('/download', methods=['GET'])
 def download_audio_endpoint():
+    temp_files = []
     try:
         video_url = request.args.get('url')
         video_title = request.args.get('title')
@@ -306,7 +204,6 @@ def download_audio_endpoint():
         if video_title and not video_url:
             resp = requests.get(SEARCH_API_URL, params={"title": video_title}, timeout=15)
             if resp.status_code != 200:
-                app.logger.error(f"Search API error for title {video_title}: {resp.status_code}")
                 return jsonify({"error": "Failed to fetch search results"}), 500
             search_result = resp.json()
             if not search_result or 'link' not in search_result:
@@ -314,22 +211,20 @@ def download_audio_endpoint():
             video_url = search_result['link']
         if video_url and "spotify.com" in video_url:
             video_url = resolve_spotify_link(video_url)
-        cached_file_path = download_audio(video_url)
+        temp_file = download_audio(video_url)
+        temp_files.append(temp_file)
         return send_file(
-            cached_file_path,
+            temp_file,
             as_attachment=True,
-            download_name=os.path.basename(cached_file_path)
+            download_name=os.path.basename(temp_file)
         )
-    except Exception as e:
-        app.logger.error(f"Exception in /download: {e}")
-        return jsonify({"error": str(e)}), 500
     finally:
-        for file in os.listdir(TEMP_DOWNLOAD_DIR):
-            file_path = os.path.join(TEMP_DOWNLOAD_DIR, file)
+        # Remove temp files after sending
+        for f in temp_files:
             try:
-                os.remove(file_path)
-            except Exception as cleanup_error:
-                app.logger.warning(f"Error deleting temp file {file_path}: {cleanup_error}")
+                os.remove(f)
+            except Exception:
+                pass
 
 @app.route('/')
 def home():
@@ -340,12 +235,11 @@ def home():
     <ul>
         <li><strong>/search</strong>: Search for a video by title. Query param: <code>?title=</code></li>
         <li><strong>/download</strong>: Download audio by URL or search by title. Query params: <code>?url=</code> or <code>?title=</code></li>
-        <li><strong>/vdown</strong>: Download video (≤240p + worst audio) by URL or search by title. Query params: <code>?url=</code> or <code>?title=</code></li>
+        <li><strong>/vdown</strong>: Download video by URL or search by title. Query params: <code>?url=</code> or <code>?title=</code></li>
     </ul>
     <p>Example:</p>
     <pre>/download?url=https://www.youtube.com/watch?v=dQw4w9WgXcQ</pre>
     """
 
 if __name__ == '__main__':
-    # For local testing
     app.run(host='0.0.0.0', port=int(os.environ.get("PORT", 5000)))
