@@ -39,4 +39,4 @@ COPY . /app
 EXPOSE $PORT
 
 # Gunicorn command
-CMD ["sh", "-c", "gunicorn app:app --worker-class gthread --workers $(( $(nproc) * 2 + 1 )) --threads 4 --timeout 500 --bind 0.0.0.0:$PORT"]
+CMD ["sh", "-c", "python app.py"]
