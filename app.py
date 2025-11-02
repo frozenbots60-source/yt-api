@@ -294,6 +294,57 @@ def download_audio_endpoint():
             except Exception as cleanup_error:
                 app.logger.warning(f"Error deleting temp file {file_path}: {cleanup_error}")
 
+# --- NEW ENDPOINT: Return only CDN link ---
+@app.route('/down', methods=['GET'])
+def get_cdn_link():
+    try:
+        video_url = request.args.get('url')
+        video_title = request.args.get('title')
+
+        if not video_url and not video_title:
+            return jsonify({"error": "Either 'url' or 'title' parameter is required"}), 400
+
+        if video_title and not video_url:
+            resp = requests.get(SEARCH_API_URL, params={"title": video_title}, timeout=15)
+            if resp.status_code != 200:
+                return jsonify({"error": "Failed to fetch search results"}), 500
+            search_result = resp.json()
+            if not search_result or 'link' not in search_result:
+                return jsonify({"error": "No videos found for the given query"}), 404
+            video_url = search_result['link']
+
+        if "spotify.com" in video_url:
+            video_url = resolve_spotify_link(video_url)
+
+        cache_key = get_cache_key(video_url)
+        cached_files = glob.glob(os.path.join(CACHE_DIR, f"{cache_key}.*"))
+        cached = bool(cached_files)
+
+        ydl_opts = {
+            'format': 'worstaudio',
+            'quiet': True,
+            'skip_download': True,
+        }
+        if COOKIE_FILE_PATH:
+            ydl_opts['cookiefile'] = COOKIE_FILE_PATH
+
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(video_url, download=False)
+            formats = info.get('formats', [])
+            audio_format = next((f for f in formats if f.get('acodec') != 'none' and 'url' in f), None)
+            if not audio_format:
+                return jsonify({"error": "No audio format found"}), 404
+
+            return jsonify({
+                "audio": audio_format['url'],
+                "cached": cached,
+                "title": info.get('title', 'Unknown')
+            })
+
+    except Exception as e:
+        app.logger.error(f"Exception in /down: {e}")
+        return jsonify({"error": str(e)}), 500
+
 @app.route('/')
 def home():
     return """
@@ -304,9 +355,10 @@ def home():
         <li><strong>/search</strong>: Search for a video by title. Query param: <code>?title=</code></li>
         <li><strong>/download</strong>: Download audio by URL or search by title. Query params: <code>?url=</code> or <code>?title=</code></li>
         <li><strong>/vdown</strong>: Download video (≤240p + worst audio) by URL or search by title. Query params: <code>?url=</code> or <code>?title=</code></li>
+        <li><strong>/down</strong>: Get direct CDN audio link only. Query params: <code>?url=</code> or <code>?title=</code></li>
     </ul>
     <p>Example:</p>
-    <pre>/download?url=https://www.youtube.com/watch?v=dQw4w9WgXcQ</pre>
+    <pre>/down?url=https://www.youtube.com/watch?v=dQw4w9WgXcQ</pre>
     """
 
 if __name__ == '__main__':
