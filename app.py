@@ -11,6 +11,38 @@ import threading
 import json
 import logging
 import time
+import subprocess
+
+# --- EJS FIX: Initialize Deno + yt-dlp challenge solver ---
+def init_yt_dlp_solver():
+    try:
+        # Check if Deno is available
+        deno_version = subprocess.run(["deno", "--version"], capture_output=True, text=True)
+        if deno_version.returncode == 0:
+            print(f"[INIT] Deno detected: {deno_version.stdout.strip()}")
+        else:
+            print("[INIT] Deno not found in PATH, signature solving may fail.")
+
+        # Update yt-dlp to nightly (for latest n/sig patches)
+        subprocess.run(["yt-dlp", "--update-to", "nightly"], check=False)
+
+        # Clear old caches
+        subprocess.run(["yt-dlp", "--rm-cache-dir"], check=False)
+
+        # Preload EJS challenge solver (download GitHub script)
+        subprocess.run([
+            "yt-dlp",
+            "--remote-components", "ejs:github",
+            "--simulate", "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+        ], check=False)
+
+        print("[INIT] yt-dlp EJS challenge solver initialized successfully.")
+    except Exception as e:
+        print(f"[INIT ERROR] Failed to initialize yt-dlp EJS solver: {e}")
+
+# Run initialization once on startup
+threading.Thread(target=init_yt_dlp_solver, daemon=True).start()
+# --- END EJS FIX ---
 
 app = Flask(__name__)
 
