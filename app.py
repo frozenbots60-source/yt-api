@@ -136,7 +136,7 @@ def make_ydl_opts_audio(output_template: str):
 
 def make_ydl_opts_video(output_template: str):
     opts = {
-        'format': 'worst[ext=mp4]/worst',  
+        'format': 'worst[ext=mp4]/worst',
         'outtmpl': output_template,
         'noplaylist': True,
         'quiet': True,
@@ -320,19 +320,67 @@ def get_cdn_link():
         cached_files = glob.glob(os.path.join(CACHE_DIR, f"{cache_key}.*"))
         cached = bool(cached_files)
 
+        # --- Improved yt-dlp options for reliable extraction (uses deno / remote components if available) ---
         ydl_opts = {
-            'format': 'worstaudio',
+            # prefer best audio with a usable protocol
+            'format': 'bestaudio[acodec!=none]/bestaudio/best',
             'quiet': True,
             'skip_download': True,
+            'noprogress': True,
+            'socket_timeout': 30,
+            'concurrent_fragment_downloads': 4,
+            'n_threads': 4,
+            # tell the python-api about js runtimes & remote components so it can use deno/ejs if available
+            'js_runtimes': {'deno': {}},
+            'remote_components': set(['ejs:github']),
+            # prefer the web player client extraction (may be adjusted)
+            'extractor_args': {'youtube': {'player_client': 'web'}},
         }
         if COOKIE_FILE_PATH:
             ydl_opts['cookiefile'] = COOKIE_FILE_PATH
 
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(video_url, download=False)
-            formats = info.get('formats', [])
-            audio_format = next((f for f in formats if f.get('acodec') != 'none' and 'url' in f), None)
+            # prefer explicit formats list
+            formats = info.get('formats') or []
+            audio_format = None
+
+            # Build candidate list: prefer non-drm audio with url, higher abr/tbr, https protocol
+            candidates = []
+            for f in formats:
+                if not f:
+                    continue
+                acodec = f.get('acodec')
+                url = f.get('url')
+                drm = f.get('drm') or False
+                if not url:
+                    continue
+                # Skip formats that are video-only or DRM-protected
+                if acodec is None or acodec == 'none' or drm:
+                    continue
+                # bitrate heuristics
+                abr = f.get('abr') or f.get('tbr') or 0
+                proto = (f.get('protocol') or '').lower()
+                candidates.append((abr, proto, f))
+
+            # sort by bitrate desc, prefer https/http protocols over others (m3u8/hls less preferred for single-url usage)
+            if candidates:
+                candidates.sort(key=lambda x: (-int(x[0] or 0), 0 if x[1].startswith('https') else 1))
+                audio_format = candidates[0][2]
+
+            # fallback: some extractors put a top-level 'url' (single-file)
             if not audio_format:
+                top_url = info.get('url')
+                if top_url:
+                    audio_format = {'url': top_url}
+                else:
+                    # as last resort, try to find any format with url
+                    for f in formats:
+                        if f and f.get('url') and not (f.get('drm') or False):
+                            audio_format = f
+                            break
+
+            if not audio_format or not audio_format.get('url'):
                 return jsonify({"error": "No audio format found"}), 404
 
             return jsonify({
