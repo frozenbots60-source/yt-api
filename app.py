@@ -23,13 +23,10 @@ def init_yt_dlp_solver():
         else:
             print("[INIT] Deno not found in PATH, signature solving may fail.")
 
-        # Update yt-dlp to nightly (for latest n/sig patches)
-        subprocess.run(["yt-dlp", "--update-to", "nightly"], check=False)
-
-        # Clear old caches
+        # Clear old caches only (NO NIGHTLY UPDATES ANYMORE)
         subprocess.run(["yt-dlp", "--rm-cache-dir"], check=False)
 
-        # Preload EJS challenge solver (download GitHub script)
+        # Preload EJS challenge solver
         subprocess.run([
             "yt-dlp",
             "--remote-components", "ejs:github",
@@ -40,9 +37,7 @@ def init_yt_dlp_solver():
     except Exception as e:
         print(f"[INIT ERROR] Failed to initialize yt-dlp EJS solver: {e}")
 
-# Run initialization once on startup
 threading.Thread(target=init_yt_dlp_solver, daemon=True).start()
-# --- END EJS FIX ---
 
 app = Flask(__name__)
 
@@ -70,7 +65,6 @@ else:
     app.logger.warning(f"Cookie file not found or unreadable at: {COOKIE_FILE_PATH}. Continuing without cookies.")
     COOKIE_FILE_PATH = None
 
-# External Search API (your existing service)
 SEARCH_API_URL = "https://odd-block-a945.tenopno.workers.dev/search"
 
 # --- Utility functions ---
@@ -92,41 +86,36 @@ def check_cache_size_and_cleanup():
         app.logger.info(f"Cache size {total_size} exceeds {MAX_CACHE_SIZE}, clearing caches.")
         for cache_dir in [CACHE_DIR, CACHE_VIDEO_DIR]:
             for file in os.listdir(cache_dir):
-                file_path = os.path.join(cache_dir, file)
                 try:
-                    os.remove(file_path)
-                except Exception as e:
-                    app.logger.warning(f"Error deleting cache file {file_path}: {e}")
+                    os.remove(os.path.join(cache_dir, file))
+                except Exception:
+                    pass
 
-# Background cache cleanup thread
 def periodic_cache_cleanup():
     while True:
         check_cache_size_and_cleanup()
-        time.sleep(60)  # every 60 seconds
+        time.sleep(60)
 
 threading.Thread(target=periodic_cache_cleanup, daemon=True).start()
 
 def resolve_spotify_link(url: str) -> str:
     if "spotify.com" in url:
-        params = {"title": url}
-        resp = requests.get(SEARCH_API_URL, params=params, timeout=15)
+        resp = requests.get(SEARCH_API_URL, params={"title": url}, timeout=15)
         if resp.status_code != 200:
-            raise Exception("Failed to fetch search results for the Spotify link")
-        search_result = resp.json()
-        if not search_result or 'link' not in search_result:
-            raise Exception("No YouTube link found for the given Spotify link")
-        return search_result['link']
+            raise Exception("Failed to fetch search results for Spotify")
+        result = resp.json()
+        if not result or "link" not in result:
+            raise Exception("No YouTube result for Spotify")
+        return result["link"]
     return url
 
 def make_ydl_opts_audio(output_template: str):
-    ffmpeg_path = os.getenv("FFMPEG_PATH", "/usr/bin/ffmpeg")
     opts = {
-        'format': 'worstaudio',
+        'format': '249',   # LOCK TO ITAG 249 ONLY
         'outtmpl': output_template,
         'noplaylist': True,
         'quiet': True,
         'socket_timeout': 60,
-        'ffmpeg_location': ffmpeg_path,
         'concurrent_fragment_downloads': 4,
         'n_threads': 4,
     }
@@ -136,7 +125,7 @@ def make_ydl_opts_audio(output_template: str):
 
 def make_ydl_opts_video(output_template: str):
     opts = {
-        'format': 'worst[ext=mp4]/worst',
+        'format': 'worstvideo[ext=mp4]+249/worst+249',  
         'outtmpl': output_template,
         'noplaylist': True,
         'quiet': True,
@@ -150,49 +139,41 @@ def make_ydl_opts_video(output_template: str):
 
 def download_audio(video_url: str) -> str:
     cache_key = get_cache_key(video_url)
-    cached_files = glob.glob(os.path.join(CACHE_DIR, f"{cache_key}.*"))
+    cached_files = glob.glob(os.path.join(CACHE_DIR, f"{cache_key}.webm"))
     if cached_files:
         return cached_files[0]
 
     unique_id = str(uuid.uuid4())
     output_template = os.path.join(TEMP_DOWNLOAD_DIR, f"{unique_id}.%(ext)s")
-    ydl_opts = make_ydl_opts_audio(output_template)
 
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        try:
-            info = ydl.extract_info(video_url, download=True)
-            downloaded_file = ydl.prepare_filename(info)
-            ext = info.get("ext", os.path.splitext(downloaded_file)[1].lstrip(".")) or "m4a"
-            cached_file_path = os.path.join(CACHE_DIR, f"{cache_key}.{ext}")
-            shutil.move(downloaded_file, cached_file_path)
-            check_cache_size_and_cleanup()
-            return cached_file_path
-        except Exception as e:
-            app.logger.error(f"Error downloading audio for {video_url}: {e}")
-            raise Exception(f"Error downloading audio: {e}")
+    with yt_dlp.YoutubeDL(make_ydl_opts_audio(output_template)) as ydl:
+        info = ydl.extract_info(video_url, download=True)
+        downloaded_file = ydl.prepare_filename(info)
+
+        cached_file_path = os.path.join(CACHE_DIR, f"{cache_key}.webm")
+        shutil.move(downloaded_file, cached_file_path)
+
+        check_cache_size_and_cleanup()
+        return cached_file_path
 
 def download_video(video_url: str) -> str:
-    cache_key = hashlib.md5((video_url + "_video").encode('utf-8')).hexdigest()
-    cached_files = glob.glob(os.path.join(CACHE_VIDEO_DIR, f"{cache_key}.*"))
+    cache_key = hashlib.md5((video_url+"_video").encode()).hexdigest()
+    cached_files = glob.glob(os.path.join(CACHE_VIDEO_DIR, f"{cache_key}.mp4"))
     if cached_files:
         return cached_files[0]
 
     unique_id = str(uuid.uuid4())
     output_template = os.path.join(TEMP_DOWNLOAD_DIR, f"{unique_id}.%(ext)s")
-    ydl_opts = make_ydl_opts_video(output_template)
 
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        try:
-            info = ydl.extract_info(video_url, download=True)
-            downloaded_file = ydl.prepare_filename(info)
-            cached_file_path = os.path.join(CACHE_VIDEO_DIR, f"{cache_key}.mp4")
-            if os.path.abspath(downloaded_file) != os.path.abspath(cached_file_path):
-                shutil.move(downloaded_file, cached_file_path)
-            check_cache_size_and_cleanup()
-            return cached_file_path
-        except Exception as e:
-            app.logger.error(f"Error downloading video for {video_url}: {e}")
-            raise Exception(f"Error downloading video: {e}")
+    with yt_dlp.YoutubeDL(make_ydl_opts_video(output_template)) as ydl:
+        info = ydl.extract_info(video_url, download=True)
+        downloaded_file = ydl.prepare_filename(info)
+
+        cached_file_path = os.path.join(CACHE_VIDEO_DIR, f"{cache_key}.mp4")
+        shutil.move(downloaded_file, cached_file_path)
+
+        check_cache_size_and_cleanup()
+        return cached_file_path
 
 # --- Endpoints ---
 
@@ -202,26 +183,26 @@ def search_video():
         query = request.args.get('title')
         if not query:
             return jsonify({"error": "The 'title' parameter is required"}), 400
+
         resp = requests.get(SEARCH_API_URL, params={"title": query}, timeout=15)
         if resp.status_code != 200:
-            app.logger.error(f"Search API returned {resp.status_code} for query {query}")
-            return jsonify({"error": "Failed to fetch search results"}), 500
-        search_result = resp.json()
-        if not search_result or 'link' not in search_result:
-            return jsonify({"error": "No videos found for the given query"}), 404
-        
-        # Pre-cache audio/video in background threads
-        video_url = search_result['link']
+            return jsonify({"error": "Search API failure"}), 500
+
+        result = resp.json()
+        if not result or "link" not in result:
+            return jsonify({"error": "No results"}), 404
+
+        video_url = result["link"]
         threading.Thread(target=download_audio, args=(video_url,), daemon=True).start()
         threading.Thread(target=download_video, args=(video_url,), daemon=True).start()
-        
+
         return jsonify({
-            "title": search_result.get("title"),
+            "title": result.get("title"),
             "url": video_url,
-            "duration": search_result.get("duration"),
+            "duration": result.get("duration"),
         })
+
     except Exception as e:
-        app.logger.error(f"Exception in /search: {e}")
         return jsonify({"error": str(e)}), 500
 
 @app.route('/vdown', methods=['GET'])
@@ -229,186 +210,102 @@ def download_video_endpoint():
     try:
         video_url = request.args.get('url')
         video_title = request.args.get('title')
-        if not video_url and not video_title:
-            return jsonify({"error": "Either 'url' or 'title' parameter is required"}), 400
+
         if video_title and not video_url:
             resp = requests.get(SEARCH_API_URL, params={"title": video_title}, timeout=15)
             if resp.status_code != 200:
-                app.logger.error(f"Search API error for title {video_title}: {resp.status_code}")
-                return jsonify({"error": "Failed to fetch search results"}), 500
-            search_result = resp.json()
-            if not search_result or 'link' not in search_result:
-                return jsonify({"error": "No videos found for the given query"}), 404
-            video_url = search_result['link']
-        if video_url and "spotify.com" in video_url:
+                return jsonify({"error": "Search API error"}), 500
+            video_url = resp.json()["link"]
+
+        if "spotify.com" in video_url:
             video_url = resolve_spotify_link(video_url)
+
         cached_file_path = download_video(video_url)
-        return send_file(
-            cached_file_path,
-            as_attachment=True,
-            download_name=os.path.basename(cached_file_path)
-        )
+        return send_file(cached_file_path, as_attachment=True)
+
     except Exception as e:
-        app.logger.error(f"Exception in /vdown: {e}")
         return jsonify({"error": str(e)}), 500
-    finally:
-        for file in os.listdir(TEMP_DOWNLOAD_DIR):
-            file_path = os.path.join(TEMP_DOWNLOAD_DIR, file)
-            try:
-                os.remove(file_path)
-            except Exception as cleanup_error:
-                app.logger.warning(f"Error deleting temp file {file_path}: {cleanup_error}")
 
 @app.route('/download', methods=['GET'])
 def download_audio_endpoint():
     try:
         video_url = request.args.get('url')
         video_title = request.args.get('title')
-        if not video_url and not video_title:
-            return jsonify({"error": "Either 'url' or 'title' parameter is required"}), 400
+
         if video_title and not video_url:
             resp = requests.get(SEARCH_API_URL, params={"title": video_title}, timeout=15)
             if resp.status_code != 200:
-                app.logger.error(f"Search API error for title {video_title}: {resp.status_code}")
-                return jsonify({"error": "Failed to fetch search results"}), 500
-            search_result = resp.json()
-            if not search_result or 'link' not in search_result:
-                return jsonify({"error": "No videos found for the given query"}), 404
-            video_url = search_result['link']
-        if video_url and "spotify.com" in video_url:
-            video_url = resolve_spotify_link(video_url)
-        cached_file_path = download_audio(video_url)
-        return send_file(
-            cached_file_path,
-            as_attachment=True,
-            download_name=os.path.basename(cached_file_path)
-        )
-    except Exception as e:
-        app.logger.error(f"Exception in /download: {e}")
-        return jsonify({"error": str(e)}), 500
-    finally:
-        for file in os.listdir(TEMP_DOWNLOAD_DIR):
-            file_path = os.path.join(TEMP_DOWNLOAD_DIR, file)
-            try:
-                os.remove(file_path)
-            except Exception as cleanup_error:
-                app.logger.warning(f"Error deleting temp file {file_path}: {cleanup_error}")
+                return jsonify({"error": "Search API error"}), 500
+            video_url = resp.json()["link"]
 
-# --- NEW ENDPOINT: Return only CDN link ---
+        if "spotify.com" in video_url:
+            video_url = resolve_spotify_link(video_url)
+
+        cached_file_path = download_audio(video_url)
+        return send_file(cached_file_path, as_attachment=True)
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+# --- CDN ONLY ENDPOINT (LOCKED TO ITAG 249 WEBM) ---
 @app.route('/down', methods=['GET'])
 def get_cdn_link():
     try:
         video_url = request.args.get('url')
         video_title = request.args.get('title')
 
-        if not video_url and not video_title:
-            return jsonify({"error": "Either 'url' or 'title' parameter is required"}), 400
-
         if video_title and not video_url:
             resp = requests.get(SEARCH_API_URL, params={"title": video_title}, timeout=15)
             if resp.status_code != 200:
-                return jsonify({"error": "Failed to fetch search results"}), 500
-            search_result = resp.json()
-            if not search_result or 'link' not in search_result:
-                return jsonify({"error": "No videos found for the given query"}), 404
-            video_url = search_result['link']
+                return jsonify({"error": "Search API error"}), 500
+            video_url = resp.json()["link"]
 
         if "spotify.com" in video_url:
             video_url = resolve_spotify_link(video_url)
 
         cache_key = get_cache_key(video_url)
-        cached_files = glob.glob(os.path.join(CACHE_DIR, f"{cache_key}.*"))
-        cached = bool(cached_files)
+        cached = bool(glob.glob(os.path.join(CACHE_DIR, f"{cache_key}.webm")))
 
-        # --- Improved yt-dlp options for reliable extraction (uses deno / remote components if available) ---
-        ydl_opts = {
-            # prefer best audio with a usable protocol
-            'format': 'bestaudio[acodec!=none]/bestaudio/best',
-            'quiet': True,
+        opts = {
+            'format': '249',
             'skip_download': True,
-            'noprogress': True,
-            'socket_timeout': 30,
-            'concurrent_fragment_downloads': 4,
-            'n_threads': 4,
-            # tell the python-api about js runtimes & remote components so it can use deno/ejs if available
-            'js_runtimes': {'deno': {}},
-            'remote_components': set(['ejs:github']),
-            # prefer the web player client extraction (may be adjusted)
-            'extractor_args': {'youtube': {'player_client': 'web'}},
+            'quiet': True,
         }
         if COOKIE_FILE_PATH:
-            ydl_opts['cookiefile'] = COOKIE_FILE_PATH
+            opts['cookiefile'] = COOKIE_FILE_PATH
 
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        with yt_dlp.YoutubeDL(opts) as ydl:
             info = ydl.extract_info(video_url, download=False)
-            # prefer explicit formats list
-            formats = info.get('formats') or []
-            audio_format = None
+            formats = info.get("formats", [])
 
-            # Build candidate list: prefer non-drm audio with url, higher abr/tbr, https protocol
-            candidates = []
-            for f in formats:
-                if not f:
-                    continue
-                acodec = f.get('acodec')
-                url = f.get('url')
-                drm = f.get('drm') or False
-                if not url:
-                    continue
-                # Skip formats that are video-only or DRM-protected
-                if acodec is None or acodec == 'none' or drm:
-                    continue
-                # bitrate heuristics
-                abr = f.get('abr') or f.get('tbr') or 0
-                proto = (f.get('protocol') or '').lower()
-                candidates.append((abr, proto, f))
-
-            # sort by bitrate desc, prefer https/http protocols over others (m3u8/hls less preferred for single-url usage)
-            if candidates:
-                candidates.sort(key=lambda x: (-int(x[0] or 0), 0 if x[1].startswith('https') else 1))
-                audio_format = candidates[0][2]
-
-            # fallback: some extractors put a top-level 'url' (single-file)
-            if not audio_format:
-                top_url = info.get('url')
-                if top_url:
-                    audio_format = {'url': top_url}
-                else:
-                    # as last resort, try to find any format with url
-                    for f in formats:
-                        if f and f.get('url') and not (f.get('drm') or False):
-                            audio_format = f
-                            break
-
-            if not audio_format or not audio_format.get('url'):
-                return jsonify({"error": "No audio format found"}), 404
+            fmt_249 = next((f for f in formats if str(f.get('format_id')) == "249"), None)
+            if not fmt_249 or "url" not in fmt_249:
+                return jsonify({"error": "itag 249 not available"}), 404
 
             return jsonify({
-                "audio": audio_format['url'],
+                "audio": fmt_249["url"],
                 "cached": cached,
-                "title": info.get('title', 'Unknown')
+                "title": info.get("title", "Unknown")
             })
 
     except Exception as e:
-        app.logger.error(f"Exception in /down: {e}")
         return jsonify({"error": str(e)}), 500
+
 
 @app.route('/')
 def home():
     return """
     <h1>🎶 YouTube Audio/Video Downloader API</h1>
-    <p>Use this API to search and download audio or video from YouTube.</p>
-    <p><strong>Endpoints:</strong></p>
+    <p><strong>Low-bitrate locked API (itag 249)</strong></p>
     <ul>
-        <li><strong>/search</strong>: Search for a video by title. Query param: <code>?title=</code></li>
-        <li><strong>/download</strong>: Download audio by URL or search by title. Query params: <code>?url=</code> or <code>?title=</code></li>
-        <li><strong>/vdown</strong>: Download video (≤240p + worst audio) by URL or search by title. Query params: <code>?url=</code> or <code>?title=</code></li>
-        <li><strong>/down</strong>: Get direct CDN audio link only. Query params: <code>?url=</code> or <code>?title=</code></li>
+        <li>/search?title=</li>
+        <li>/download?url=</li>
+        <li>/vdown?url=</li>
+        <li>/down?url=</li>
     </ul>
-    <p>Example:</p>
-    <pre>/down?url=https://www.youtube.com/watch?v=dQw4w9WgXcQ</pre>
     """
 
+
 if __name__ == '__main__':
-    # For local testing
     app.run(host='0.0.0.0', port=int(os.environ.get("PORT", 5000)))
