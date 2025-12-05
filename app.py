@@ -124,25 +124,19 @@ def make_ydl_opts_audio(output_template: str):
     return opts
 
 def make_ydl_opts_video(output_template: str):
-    """
-    Use the best available video + best audio (preferred).
-    Ensure merge_output_format is set by caller to force mp4 merge when needed.
-    """
     opts = {
-        # Prefer bestvideo + bestaudio. yt-dlp will merge using ffmpeg when necessary.
-        'format': 'bestvideo+bestaudio/best',
+        'format': '(bestvideo[ext=mp4][height<=360]/bestvideo[height<=360])+bestaudio[ext=m4a]/best[ext=mp4]/best',
         'outtmpl': output_template,
         'noplaylist': True,
         'quiet': True,
         'socket_timeout': 60,
         'concurrent_fragment_downloads': 4,
         'n_threads': 4,
-        # Prefer ffmpeg for merging (yt-dlp picks it automatically, but this helps)
-        'postprocessor_args': [],
     }
     if COOKIE_FILE_PATH:
         opts['cookiefile'] = COOKIE_FILE_PATH
     return opts
+
 
 def download_audio(video_url: str) -> str:
     cache_key = get_cache_key(video_url)
