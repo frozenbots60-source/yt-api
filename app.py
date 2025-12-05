@@ -125,7 +125,7 @@ def make_ydl_opts_audio(output_template: str):
 
 def make_ydl_opts_video(output_template: str):
     opts = {
-        'format': 'worstvideo[ext=mp4]+249/worst+249',  
+        'format': '(bestvideo[ext=mp4][height<=720]/bestvideo[height<=720])+bestaudio[ext=m4a]/best[ext=mp4]/best',
         'outtmpl': output_template,
         'noplaylist': True,
         'quiet': True,
