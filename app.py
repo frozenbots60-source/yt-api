@@ -124,14 +124,21 @@ def make_ydl_opts_audio(output_template: str):
     return opts
 
 def make_ydl_opts_video(output_template: str):
+    """
+    Use the best available video + best audio (preferred).
+    Ensure merge_output_format is set by caller to force mp4 merge when needed.
+    """
     opts = {
-        'format': '(bestvideo[ext=mp4][height<=720]/bestvideo[height<=720])+bestaudio[ext=m4a]/best[ext=mp4]/best',
+        # Prefer bestvideo + bestaudio. yt-dlp will merge using ffmpeg when necessary.
+        'format': 'bestvideo+bestaudio/best',
         'outtmpl': output_template,
         'noplaylist': True,
         'quiet': True,
         'socket_timeout': 60,
         'concurrent_fragment_downloads': 4,
         'n_threads': 4,
+        # Prefer ffmpeg for merging (yt-dlp picks it automatically, but this helps)
+        'postprocessor_args': [],
     }
     if COOKIE_FILE_PATH:
         opts['cookiefile'] = COOKIE_FILE_PATH
@@ -150,14 +157,27 @@ def download_audio(video_url: str) -> str:
         info = ydl.extract_info(video_url, download=True)
         downloaded_file = ydl.prepare_filename(info)
 
+        # Move to cache with .webm extension (locked itag 249 -> webm)
         cached_file_path = os.path.join(CACHE_DIR, f"{cache_key}.webm")
-        shutil.move(downloaded_file, cached_file_path)
+        try:
+            shutil.move(downloaded_file, cached_file_path)
+        except Exception:
+            # If prepare_filename didn't point to final file (edge-cases), fallback to glob
+            candidates = glob.glob(os.path.join(TEMP_DOWNLOAD_DIR, f"{unique_id}.*"))
+            if not candidates:
+                raise Exception("Audio download failed: no file produced")
+            downloaded_file = candidates[0]
+            shutil.move(downloaded_file, cached_file_path)
 
         check_cache_size_and_cleanup()
         return cached_file_path
 
 def download_video(video_url: str) -> str:
-    cache_key = hashlib.md5((video_url+"_video").encode()).hexdigest()
+    """
+    Downloads the best video + best audio, merges into mp4 when necessary,
+    caches the result as {cache_key}.mp4 and returns the cached file path.
+    """
+    cache_key = hashlib.md5((video_url + "_video").encode()).hexdigest()
     cached_files = glob.glob(os.path.join(CACHE_VIDEO_DIR, f"{cache_key}.mp4"))
     if cached_files:
         return cached_files[0]
@@ -165,15 +185,47 @@ def download_video(video_url: str) -> str:
     unique_id = str(uuid.uuid4())
     output_template = os.path.join(TEMP_DOWNLOAD_DIR, f"{unique_id}.%(ext)s")
 
-    with yt_dlp.YoutubeDL(make_ydl_opts_video(output_template)) as ydl:
+    opts = make_ydl_opts_video(output_template)
+    # Force merge to mp4 if merging is required
+    opts['merge_output_format'] = 'mp4'
+    # Make sure we are not writing to cache dir directly to avoid partial files there
+    with yt_dlp.YoutubeDL(opts) as ydl:
         info = ydl.extract_info(video_url, download=True)
-        downloaded_file = ydl.prepare_filename(info)
 
-        cached_file_path = os.path.join(CACHE_VIDEO_DIR, f"{cache_key}.mp4")
+    # After download, find produced file(s)
+    candidates = glob.glob(os.path.join(TEMP_DOWNLOAD_DIR, f"{unique_id}.*"))
+    if not candidates:
+        # As a fallback, attempt to use ydl.prepare_filename(info) if available
+        try:
+            downloaded_file = ydl.prepare_filename(info)
+        except Exception:
+            raise Exception("Video download failed: no file produced")
+    else:
+        # Prefer mp4 final merged file if present
+        mp4_candidate = next((c for c in candidates if c.lower().endswith('.mp4')), None)
+        downloaded_file = mp4_candidate or candidates[0]
+
+    # Ensure final cache file path ends with .mp4
+    cached_file_path = os.path.join(CACHE_VIDEO_DIR, f"{cache_key}.mp4")
+    try:
         shutil.move(downloaded_file, cached_file_path)
+    except Exception:
+        # If moving fails, try copying then removing
+        shutil.copy2(downloaded_file, cached_file_path)
+        try:
+            os.remove(downloaded_file)
+        except Exception:
+            pass
 
-        check_cache_size_and_cleanup()
-        return cached_file_path
+    # Cleanup any remaining temp candidates for this unique_id
+    for c in glob.glob(os.path.join(TEMP_DOWNLOAD_DIR, f"{unique_id}.*")):
+        try:
+            os.remove(c)
+        except Exception:
+            pass
+
+    check_cache_size_and_cleanup()
+    return cached_file_path
 
 # --- Endpoints ---
 
