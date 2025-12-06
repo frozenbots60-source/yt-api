@@ -125,7 +125,7 @@ def make_ydl_opts_audio(output_template: str):
 
 def make_ydl_opts_video(output_template: str):
     opts = {
-        'format': '(bestvideo[ext=mp4][height<=360]/bestvideo[height<=360])+bestaudio[ext=m4a]/best[ext=mp4]/best',
+        'format': 'best[ext=mp4][vcodec^=avc1][acodec^=mp4a][height<=360]/best[ext=mp4]/best',
         'outtmpl': output_template,
         'noplaylist': True,
         'quiet': True,
@@ -136,6 +136,7 @@ def make_ydl_opts_video(output_template: str):
     if COOKIE_FILE_PATH:
         opts['cookiefile'] = COOKIE_FILE_PATH
     return opts
+
 
 
 def download_audio(video_url: str) -> str:
