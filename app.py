@@ -12,6 +12,8 @@ import json
 import logging
 import time
 import subprocess
+import platform
+import zipfile
 
 # --- EJS FIX: Initialize Deno + yt-dlp challenge solver ---
 TEMP_DIR = os.path.abspath("./temp")
@@ -49,6 +51,49 @@ def ensure_deno():
 
     print("[INIT] Deno downloaded successfully.")
     return DENO_EXE
+
+
+def init_yt_dlp_solver():
+    try:
+        deno_path = ensure_deno()
+
+        env = os.environ.copy()
+        env["PATH"] = DENO_DIR + os.pathsep + env.get("PATH", "")
+
+        deno_version = subprocess.run(
+            [deno_path, "--version"],
+            capture_output=True,
+            text=True,
+            env=env
+        )
+
+        if deno_version.returncode == 0:
+            print(f"[INIT] Deno ready: {deno_version.stdout.splitlines()[0]}")
+        else:
+            print("[INIT] Deno failed to execute")
+
+        subprocess.run(
+            ["yt-dlp", "--rm-cache-dir"],
+            check=False,
+            env=env
+        )
+
+        subprocess.run(
+            [
+                "yt-dlp",
+                "--remote-components", "ejs:github",
+                "--simulate", "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+            ],
+            check=False,
+            env=env
+        )
+
+        print("[INIT] yt-dlp EJS solver initialized.")
+
+    except Exception as e:
+        print(f"[INIT ERROR] {e}")
+
+
 threading.Thread(target=init_yt_dlp_solver, daemon=True).start()
 
 app = Flask(__name__)
