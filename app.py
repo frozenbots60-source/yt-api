@@ -304,13 +304,28 @@ def get_cdn_link():
 
         if video_title and not video_url:
             resp = requests.get(SEARCH_API_URL, params={"title": video_title}, timeout=15)
-            if resp.status_code != 200:
-                return jsonify({"error": "Search API error"}), 500
             video_url = resp.json()["link"]
 
         if "spotify.com" in video_url:
             video_url = resolve_spotify_link(video_url)
 
+        # ---- KICK PATH ----
+        if is_kick_url(video_url):
+            with yt_dlp.YoutubeDL(make_ydl_opts_kick()) as ydl:
+                info = ydl.extract_info(video_url, download=False)
+
+                hls_url = info.get("url")
+                if not hls_url:
+                    return jsonify({"error": "No HLS stream found"}), 404
+
+                return jsonify({
+                    "type": "kick",
+                    "stream": hls_url,
+                    "title": info.get("title"),
+                    "is_live": info.get("is_live", True)
+                })
+
+        # ---- YOUTUBE PATH ----
         cache_key = get_cache_key(video_url)
         cached = bool(glob.glob(os.path.join(CACHE_DIR, f"{cache_key}.webm")))
 
@@ -331,13 +346,15 @@ def get_cdn_link():
                 return jsonify({"error": "itag 249 not available"}), 404
 
             return jsonify({
+                "type": "youtube",
                 "audio": fmt_249["url"],
                 "cached": cached,
-                "title": info.get("title", "Unknown")
+                "title": info.get("title")
             })
 
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
 
 
 @app.route('/')
