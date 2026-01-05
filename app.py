@@ -14,26 +14,41 @@ import time
 import subprocess
 
 # --- EJS FIX: Initialize Deno + yt-dlp challenge solver ---
-def init_yt_dlp_solver():
-    try:
-        deno_version = subprocess.run(["deno", "--version"], capture_output=True, text=True)
-        if deno_version.returncode == 0:
-            print(f"[INIT] Deno detected: {deno_version.stdout.strip()}")
-        else:
-            print("[INIT] Deno not found in PATH, signature solving may fail.")
+TEMP_DIR = os.path.abspath("./temp")
+DENO_DIR = os.path.join(TEMP_DIR, "deno")
+DENO_EXE = os.path.join(DENO_DIR, "deno.exe")
 
-        subprocess.run(["yt-dlp", "--rm-cache-dir"], check=False)
 
-        subprocess.run([
-            "yt-dlp",
-            "--remote-components", "ejs:github",
-            "--simulate", "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
-        ], check=False)
+def ensure_deno():
+    if os.path.exists(DENO_EXE):
+        return DENO_EXE
 
-        print("[INIT] yt-dlp EJS challenge solver initialized successfully.")
-    except Exception as e:
-        print(f"[INIT ERROR] Failed to initialize yt-dlp EJS solver: {e}")
+    if platform.system().lower() != "windows":
+        raise RuntimeError("Auto Deno download implemented only for Windows")
 
+    os.makedirs(DENO_DIR, exist_ok=True)
+
+    print("[INIT] Deno not found. Downloading...")
+
+    deno_url = "https://github.com/denoland/deno/releases/latest/download/deno-x86_64-pc-windows-msvc.zip"
+    zip_path = os.path.join(TEMP_DIR, "deno.zip")
+
+    with requests.get(deno_url, stream=True, timeout=30) as r:
+        r.raise_for_status()
+        with open(zip_path, "wb") as f:
+            for chunk in r.iter_content(chunk_size=8192):
+                f.write(chunk)
+
+    with zipfile.ZipFile(zip_path, "r") as zip_ref:
+        zip_ref.extractall(DENO_DIR)
+
+    os.remove(zip_path)
+
+    if not os.path.exists(DENO_EXE):
+        raise RuntimeError("Deno download failed")
+
+    print("[INIT] Deno downloaded successfully.")
+    return DENO_EXE
 threading.Thread(target=init_yt_dlp_solver, daemon=True).start()
 
 app = Flask(__name__)
