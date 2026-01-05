@@ -16,17 +16,14 @@ import subprocess
 # --- EJS FIX: Initialize Deno + yt-dlp challenge solver ---
 def init_yt_dlp_solver():
     try:
-        # Check if Deno is available
         deno_version = subprocess.run(["deno", "--version"], capture_output=True, text=True)
         if deno_version.returncode == 0:
             print(f"[INIT] Deno detected: {deno_version.stdout.strip()}")
         else:
             print("[INIT] Deno not found in PATH, signature solving may fail.")
 
-        # Clear old caches only (NO NIGHTLY UPDATES ANYMORE)
         subprocess.run(["yt-dlp", "--rm-cache-dir"], check=False)
 
-        # Preload EJS challenge solver
         subprocess.run([
             "yt-dlp",
             "--remote-components", "ejs:github",
@@ -68,6 +65,19 @@ else:
 SEARCH_API_URL = "https://odd-block-a945.tenopno.workers.dev/search"
 
 # --- Utility functions ---
+def is_kick_url(url: str) -> bool:
+    return "kick.com/" in url.lower()
+
+def make_ydl_opts_kick():
+    opts = {
+        "quiet": True,
+        "skip_download": True,
+        "format": "best",
+    }
+    if COOKIE_FILE_PATH:
+        opts["cookiefile"] = COOKIE_FILE_PATH
+    return opts
+
 def get_cache_key(video_url: str) -> str:
     return hashlib.md5(video_url.encode('utf-8')).hexdigest()
 
@@ -111,7 +121,7 @@ def resolve_spotify_link(url: str) -> str:
 
 def make_ydl_opts_audio(output_template: str):
     opts = {
-        'format': '249',   # LOCK TO ITAG 249 ONLY
+        'format': '249',
         'outtmpl': output_template,
         'noplaylist': True,
         'quiet': True,
@@ -137,165 +147,7 @@ def make_ydl_opts_video(output_template: str):
         opts['cookiefile'] = COOKIE_FILE_PATH
     return opts
 
-
-
-def download_audio(video_url: str) -> str:
-    cache_key = get_cache_key(video_url)
-    cached_files = glob.glob(os.path.join(CACHE_DIR, f"{cache_key}.webm"))
-    if cached_files:
-        return cached_files[0]
-
-    unique_id = str(uuid.uuid4())
-    output_template = os.path.join(TEMP_DOWNLOAD_DIR, f"{unique_id}.%(ext)s")
-
-    with yt_dlp.YoutubeDL(make_ydl_opts_audio(output_template)) as ydl:
-        info = ydl.extract_info(video_url, download=True)
-        downloaded_file = ydl.prepare_filename(info)
-
-        # Move to cache with .webm extension (locked itag 249 -> webm)
-        cached_file_path = os.path.join(CACHE_DIR, f"{cache_key}.webm")
-        try:
-            shutil.move(downloaded_file, cached_file_path)
-        except Exception:
-            # If prepare_filename didn't point to final file (edge-cases), fallback to glob
-            candidates = glob.glob(os.path.join(TEMP_DOWNLOAD_DIR, f"{unique_id}.*"))
-            if not candidates:
-                raise Exception("Audio download failed: no file produced")
-            downloaded_file = candidates[0]
-            shutil.move(downloaded_file, cached_file_path)
-
-        check_cache_size_and_cleanup()
-        return cached_file_path
-
-def download_video(video_url: str) -> str:
-    """
-    Downloads the best video + best audio, merges into mp4 when necessary,
-    caches the result as {cache_key}.mp4 and returns the cached file path.
-    """
-    cache_key = hashlib.md5((video_url + "_video").encode()).hexdigest()
-    cached_files = glob.glob(os.path.join(CACHE_VIDEO_DIR, f"{cache_key}.mp4"))
-    if cached_files:
-        return cached_files[0]
-
-    unique_id = str(uuid.uuid4())
-    output_template = os.path.join(TEMP_DOWNLOAD_DIR, f"{unique_id}.%(ext)s")
-
-    opts = make_ydl_opts_video(output_template)
-    # Force merge to mp4 if merging is required
-    opts['merge_output_format'] = 'mp4'
-    # Make sure we are not writing to cache dir directly to avoid partial files there
-    with yt_dlp.YoutubeDL(opts) as ydl:
-        info = ydl.extract_info(video_url, download=True)
-
-    # After download, find produced file(s)
-    candidates = glob.glob(os.path.join(TEMP_DOWNLOAD_DIR, f"{unique_id}.*"))
-    if not candidates:
-        # As a fallback, attempt to use ydl.prepare_filename(info) if available
-        try:
-            downloaded_file = ydl.prepare_filename(info)
-        except Exception:
-            raise Exception("Video download failed: no file produced")
-    else:
-        # Prefer mp4 final merged file if present
-        mp4_candidate = next((c for c in candidates if c.lower().endswith('.mp4')), None)
-        downloaded_file = mp4_candidate or candidates[0]
-
-    # Ensure final cache file path ends with .mp4
-    cached_file_path = os.path.join(CACHE_VIDEO_DIR, f"{cache_key}.mp4")
-    try:
-        shutil.move(downloaded_file, cached_file_path)
-    except Exception:
-        # If moving fails, try copying then removing
-        shutil.copy2(downloaded_file, cached_file_path)
-        try:
-            os.remove(downloaded_file)
-        except Exception:
-            pass
-
-    # Cleanup any remaining temp candidates for this unique_id
-    for c in glob.glob(os.path.join(TEMP_DOWNLOAD_DIR, f"{unique_id}.*")):
-        try:
-            os.remove(c)
-        except Exception:
-            pass
-
-    check_cache_size_and_cleanup()
-    return cached_file_path
-
-# --- Endpoints ---
-
-@app.route('/search', methods=['GET'])
-def search_video():
-    try:
-        query = request.args.get('title')
-        if not query:
-            return jsonify({"error": "The 'title' parameter is required"}), 400
-
-        resp = requests.get(SEARCH_API_URL, params={"title": query}, timeout=15)
-        if resp.status_code != 200:
-            return jsonify({"error": "Search API failure"}), 500
-
-        result = resp.json()
-        if not result or "link" not in result:
-            return jsonify({"error": "No results"}), 404
-
-        video_url = result["link"]
-        threading.Thread(target=download_audio, args=(video_url,), daemon=True).start()
-        threading.Thread(target=download_video, args=(video_url,), daemon=True).start()
-
-        return jsonify({
-            "title": result.get("title"),
-            "url": video_url,
-            "duration": result.get("duration"),
-        })
-
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-@app.route('/vdown', methods=['GET'])
-def download_video_endpoint():
-    try:
-        video_url = request.args.get('url')
-        video_title = request.args.get('title')
-
-        if video_title and not video_url:
-            resp = requests.get(SEARCH_API_URL, params={"title": video_title}, timeout=15)
-            if resp.status_code != 200:
-                return jsonify({"error": "Search API error"}), 500
-            video_url = resp.json()["link"]
-
-        if "spotify.com" in video_url:
-            video_url = resolve_spotify_link(video_url)
-
-        cached_file_path = download_video(video_url)
-        return send_file(cached_file_path, as_attachment=True)
-
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-@app.route('/download', methods=['GET'])
-def download_audio_endpoint():
-    try:
-        video_url = request.args.get('url')
-        video_title = request.args.get('title')
-
-        if video_title and not video_url:
-            resp = requests.get(SEARCH_API_URL, params={"title": video_title}, timeout=15)
-            if resp.status_code != 200:
-                return jsonify({"error": "Search API error"}), 500
-            video_url = resp.json()["link"]
-
-        if "spotify.com" in video_url:
-            video_url = resolve_spotify_link(video_url)
-
-        cached_file_path = download_audio(video_url)
-        return send_file(cached_file_path, as_attachment=True)
-
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-
-# --- CDN ONLY ENDPOINT (LOCKED TO ITAG 249 WEBM) ---
+# --- CDN ONLY ENDPOINT (LOCKED TO ITAG 249 WEBM OR KICK HLS) ---
 @app.route('/down', methods=['GET'])
 def get_cdn_link():
     try:
@@ -355,8 +207,6 @@ def get_cdn_link():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-
-
 @app.route('/')
 def home():
     return """
@@ -369,7 +219,6 @@ def home():
         <li>/down?url=</li>
     </ul>
     """
-
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=int(os.environ.get("PORT", 5000)))
