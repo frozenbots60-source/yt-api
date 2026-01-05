@@ -14,6 +14,7 @@ import time
 import subprocess
 import platform
 import zipfile
+import sys
 
 # --- EJS FIX: Initialize Deno + yt-dlp challenge solver ---
 TEMP_DIR = os.path.abspath("./temp")
@@ -53,45 +54,75 @@ def ensure_deno():
     return DENO_EXE
 
 
+def ensure_impersonation_backend():
+    """
+    Ensure curl-cffi (impersonation backend) is available. Attempt to install it via pip if missing.
+    This helps yt-dlp perform browser impersonation (required for Kick on Linux/Heroku).
+    """
+    try:
+        import curl_cffi  # type: ignore
+        print("[INIT] curl-cffi already installed")
+        return
+    except Exception:
+        pass
+
+    print("[INIT] curl-cffi not found. Installing via pip...")
+
+    try:
+        subprocess.run(
+            [sys.executable, "-m", "pip", "install", "--no-cache-dir", "curl-cffi>=0.6.0"],
+            check=True,
+        )
+        print("[INIT] curl-cffi installed successfully")
+    except Exception as e:
+        print(f"[INIT ERROR] Failed to install curl-cffi: {e}")
+
+
 def init_yt_dlp_solver():
     try:
-        deno_path = ensure_deno()
+        # Ensure impersonation backend (curl-cffi) is present on Linux environments
+        try:
+            ensure_impersonation_backend()
+        except Exception as ie:
+            print(f"[INIT WARNING] ensure_impersonation_backend failed: {ie}")
 
+        deno_path = None
+        try:
+            deno_path = ensure_deno()
+        except Exception as de:
+            # keep behavior consistent with previous runs: print and continue
+            print(f"[INIT ERROR] {de}")
+
+        # If Deno was downloaded / found, add it to PATH for the subprocess calls below
         env = os.environ.copy()
-        env["PATH"] = DENO_DIR + os.pathsep + env.get("PATH", "")
+        if deno_path:
+            env["PATH"] = DENO_DIR + os.pathsep + env.get("PATH", "")
 
-        deno_version = subprocess.run(
-            [deno_path, "--version"],
-            capture_output=True,
-            text=True,
-            env=env
-        )
+        # Clear old caches only (NO NIGHTLY UPDATES ANYMORE)
+        try:
+            subprocess.run(["yt-dlp", "--rm-cache-dir"], check=False, env=env)
+        except Exception as e:
+            print(f"[INIT WARNING] Failed to run yt-dlp --rm-cache-dir: {e}")
 
-        if deno_version.returncode == 0:
-            print(f"[INIT] Deno ready: {deno_version.stdout.splitlines()[0]}")
-        else:
-            print("[INIT] Deno failed to execute")
-
-        subprocess.run(
-            ["yt-dlp", "--rm-cache-dir"],
-            check=False,
-            env=env
-        )
-
-        subprocess.run(
-            [
-                "yt-dlp",
-                "--remote-components", "ejs:github",
-                "--simulate", "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
-            ],
-            check=False,
-            env=env
-        )
-
-        print("[INIT] yt-dlp EJS solver initialized.")
+        # Preload EJS challenge solver (best-effort)
+        try:
+            subprocess.run(
+                [
+                    "yt-dlp",
+                    "--remote-components",
+                    "ejs:github",
+                    "--simulate",
+                    "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+                ],
+                check=False,
+                env=env,
+            )
+            print("[INIT] yt-dlp EJS challenge solver initialized successfully.")
+        except Exception as e:
+            print(f"[INIT WARNING] Failed to preload EJS solver: {e}")
 
     except Exception as e:
-        print(f"[INIT ERROR] {e}")
+        print(f"[INIT ERROR] Failed to initialize yt-dlp EJS solver: {e}")
 
 
 threading.Thread(target=init_yt_dlp_solver, daemon=True).start()
@@ -206,6 +237,162 @@ def make_ydl_opts_video(output_template: str):
     if COOKIE_FILE_PATH:
         opts['cookiefile'] = COOKIE_FILE_PATH
     return opts
+
+def download_audio(video_url: str) -> str:
+    cache_key = get_cache_key(video_url)
+    cached_files = glob.glob(os.path.join(CACHE_DIR, f"{cache_key}.webm"))
+    if cached_files:
+        return cached_files[0]
+
+    unique_id = str(uuid.uuid4())
+    output_template = os.path.join(TEMP_DOWNLOAD_DIR, f"{unique_id}.%(ext)s")
+
+    with yt_dlp.YoutubeDL(make_ydl_opts_audio(output_template)) as ydl:
+        info = ydl.extract_info(video_url, download=True)
+        downloaded_file = ydl.prepare_filename(info)
+
+        # Move to cache with .webm extension (locked itag 249 -> webm)
+        cached_file_path = os.path.join(CACHE_DIR, f"{cache_key}.webm")
+        try:
+            shutil.move(downloaded_file, cached_file_path)
+        except Exception:
+            # If prepare_filename didn't point to final file (edge-cases), fallback to glob
+            candidates = glob.glob(os.path.join(TEMP_DOWNLOAD_DIR, f"{unique_id}.*"))
+            if not candidates:
+                raise Exception("Audio download failed: no file produced")
+            downloaded_file = candidates[0]
+            shutil.move(downloaded_file, cached_file_path)
+
+        check_cache_size_and_cleanup()
+        return cached_file_path
+
+def download_video(video_url: str) -> str:
+    """
+    Downloads the best video + best audio, merges into mp4 when necessary,
+    caches the result as {cache_key}.mp4 and returns the cached file path.
+    """
+    cache_key = hashlib.md5((video_url + "_video").encode()).hexdigest()
+    cached_files = glob.glob(os.path.join(CACHE_VIDEO_DIR, f"{cache_key}.mp4"))
+    if cached_files:
+        return cached_files[0]
+
+    unique_id = str(uuid.uuid4())
+    output_template = os.path.join(TEMP_DOWNLOAD_DIR, f"{unique_id}.%(ext)s")
+
+    opts = make_ydl_opts_video(output_template)
+    # Force merge to mp4 if merging is required
+    opts['merge_output_format'] = 'mp4'
+    # Make sure we are not writing to cache dir directly to avoid partial files there
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        info = ydl.extract_info(video_url, download=True)
+
+    # After download, find produced file(s)
+    candidates = glob.glob(os.path.join(TEMP_DOWNLOAD_DIR, f"{unique_id}.*"))
+    if not candidates:
+        # As a fallback, attempt to use ydl.prepare_filename(info) if available
+        try:
+            downloaded_file = ydl.prepare_filename(info)
+        except Exception:
+            raise Exception("Video download failed: no file produced")
+    else:
+        # Prefer mp4 final merged file if present
+        mp4_candidate = next((c for c in candidates if c.lower().endswith('.mp4')), None)
+        downloaded_file = mp4_candidate or candidates[0]
+
+    # Ensure final cache file path ends with .mp4
+    cached_file_path = os.path.join(CACHE_VIDEO_DIR, f"{cache_key}.mp4")
+    try:
+        shutil.move(downloaded_file, cached_file_path)
+    except Exception:
+        # If moving fails, try copying then removing
+        shutil.copy2(downloaded_file, cached_file_path)
+        try:
+            os.remove(downloaded_file)
+        except Exception:
+            pass
+
+    # Cleanup any remaining temp candidates for this unique_id
+    for c in glob.glob(os.path.join(TEMP_DOWNLOAD_DIR, f"{unique_id}.*")):
+        try:
+            os.remove(c)
+        except Exception:
+            pass
+
+    check_cache_size_and_cleanup()
+    return cached_file_path
+
+# --- Endpoints ---
+
+@app.route('/search', methods=['GET'])
+def search_video():
+    try:
+        query = request.args.get('title')
+        if not query:
+            return jsonify({"error": "The 'title' parameter is required"}), 400
+
+        resp = requests.get(SEARCH_API_URL, params={"title": query}, timeout=15)
+        if resp.status_code != 200:
+            return jsonify({"error": "Search API failure"}), 500
+
+        result = resp.json()
+        if not result or "link" not in result:
+            return jsonify({"error": "No results"}), 404
+
+        video_url = result["link"]
+        threading.Thread(target=download_audio, args=(video_url,), daemon=True).start()
+        threading.Thread(target=download_video, args=(video_url,), daemon=True).start()
+
+        return jsonify({
+            "title": result.get("title"),
+            "url": video_url,
+            "duration": result.get("duration"),
+        })
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/vdown', methods=['GET'])
+def download_video_endpoint():
+    try:
+        video_url = request.args.get('url')
+        video_title = request.args.get('title')
+
+        if video_title and not video_url:
+            resp = requests.get(SEARCH_API_URL, params={"title": video_title}, timeout=15)
+            if resp.status_code != 200:
+                return jsonify({"error": "Search API error"}), 500
+            video_url = resp.json()["link"]
+
+        if "spotify.com" in video_url:
+            video_url = resolve_spotify_link(video_url)
+
+        cached_file_path = download_video(video_url)
+        return send_file(cached_file_path, as_attachment=True)
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/download', methods=['GET'])
+def download_audio_endpoint():
+    try:
+        video_url = request.args.get('url')
+        video_title = request.args.get('title')
+
+        if video_title and not video_url:
+            resp = requests.get(SEARCH_API_URL, params={"title": video_title}, timeout=15)
+            if resp.status_code != 200:
+                return jsonify({"error": "Search API error"}), 500
+            video_url = resp.json()["link"]
+
+        if "spotify.com" in video_url:
+            video_url = resolve_spotify_link(video_url)
+
+        cached_file_path = download_audio(video_url)
+        return send_file(cached_file_path, as_attachment=True)
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
 
 # --- CDN ONLY ENDPOINT (LOCKED TO ITAG 249 WEBM OR KICK HLS) ---
 @app.route('/down', methods=['GET'])
