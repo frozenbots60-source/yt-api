@@ -111,7 +111,7 @@ def resolve_spotify_link(url: str) -> str:
 
 def make_ydl_opts_audio(output_template: str):
     opts = {
-        'format': '249',   # LOCK TO ITAG 249 ONLY
+        'format': '249/worstaudio',   # FIX: Try itag 249, fallback to lowest quality audio
         'outtmpl': output_template,
         'noplaylist': True,
         'quiet': True,
@@ -152,7 +152,7 @@ def download_audio(video_url: str) -> str:
         info = ydl.extract_info(video_url, download=True)
         downloaded_file = ydl.prepare_filename(info)
 
-        # Move to cache with .webm extension (locked itag 249 -> webm)
+        # Move to cache with .webm extension
         cached_file_path = os.path.join(CACHE_DIR, f"{cache_key}.webm")
         try:
             shutil.move(downloaded_file, cached_file_path)
@@ -344,7 +344,7 @@ def get_cdn_link():
 def home():
     return """
     <h1>🎶 YouTube Audio/Video Downloader API</h1>
-    <p><strong>Low-bitrate locked API (itag 249)</strong></p>
+    <p><strong>Low-bitrate locked API (itag 249 with fallback)</strong></p>
     <ul>
         <li>/search?title=</li>
         <li>/download?url=</li>
