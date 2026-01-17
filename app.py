@@ -17,11 +17,37 @@ import subprocess
 def init_yt_dlp_solver():
     try:
         # Check if Deno is available
-        deno_version = subprocess.run(["deno", "--version"], capture_output=True, text=True)
-        if deno_version.returncode == 0:
-            print(f"[INIT] Deno detected: {deno_version.stdout.strip()}")
+        deno_check = subprocess.run(["deno", "--version"], capture_output=True, text=True)
+        
+        if deno_check.returncode == 0:
+            print(f"[INIT] Deno detected: {deno_check.stdout.strip()}")
         else:
-            print("[INIT] Deno not found in PATH, signature solving may fail.")
+            print("[INIT] Deno not found. Attempting to install...")
+            
+            # Install Deno using the standard installation script
+            try:
+                install_cmd = "curl -fsSL https://deno.land/x/install/install.sh | sh"
+                subprocess.run(install_cmd, shell=True, check=True)
+                
+                # Determine Deno bin path (usually ~/.deno/bin)
+                home_dir = os.path.expanduser("~")
+                deno_bin_path = os.path.join(home_dir, ".deno", "bin")
+                
+                if os.path.exists(deno_bin_path):
+                    # Add to PATH environment variable for the current process
+                    os.environ["PATH"] += os.pathsep + deno_bin_path
+                    print(f"[INIT] Deno installed successfully to {deno_bin_path} and added to PATH.")
+                    
+                    # Verify installation
+                    verify_check = subprocess.run(["deno", "--version"], capture_output=True, text=True)
+                    if verify_check.returncode == 0:
+                        print(f"[INIT] Verified Deno version: {verify_check.stdout.strip()}")
+                    else:
+                        print("[INIT ERROR] Deno installed but failed to run.")
+                else:
+                    print("[INIT ERROR] Deno installation script ran, but binary not found.")
+            except Exception as e:
+                print(f"[INIT ERROR] Failed to install Deno: {e}")
 
         # Clear old caches only (NO NIGHTLY UPDATES ANYMORE)
         subprocess.run(["yt-dlp", "--rm-cache-dir"], check=False)
