@@ -3,4 +3,3 @@ git+https://github.com/yt-dlp/yt-dlp.git
 gunicorn
 flask[async]
 requests
-upstash-redis
